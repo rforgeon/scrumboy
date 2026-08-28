@@ -24,13 +24,33 @@ func (s *Server) requireProjectMaintainerOrHigher(ctx context.Context, projectID
 	return s.requireProjectRole(ctx, projectID, store.RoleMaintainer)
 }
 
+// parseAssigneeFilterFromQuery validates the assignee query value and resolves
+// the "me" sentinel from the authenticated request actor when one is available.
+func (s *Server) parseAssigneeFilterFromQuery(ctx context.Context, r *http.Request) (store.AssigneeFilter, error) {
+	var actorUserID *int64
+	if userID, ok := store.UserIDFromContext(ctx); ok {
+		actorUserID = &userID
+	}
+	return store.ParseAssigneeFilter(r.URL.Query().Get("assignee"), actorUserID)
+}
+
+// parsePriorityFilterFromQuery validates the board "priority" query value.
+func (s *Server) parsePriorityFilterFromQuery(r *http.Request) (store.PriorityFilter, error) {
+	return store.ParsePriorityFilter(r.URL.Query().Get("priority"))
+}
+
+// parseSortOrderFromQuery validates the board "sort" query value.
+func (s *Server) parseSortOrderFromQuery(r *http.Request) (store.SortOrder, error) {
+	return store.ParseSortOrder(r.URL.Query().Get("sort"))
+}
+
 // parseSprintFilterFromQuery parses sprintId from the request query and returns a SprintFilter.
 // Absence of sprintId -> Mode "none" (no sprint filter).
 // sprintId=scheduled -> Mode "scheduled" (sprint_id IS NOT NULL, i.e. "Scheduled" view). "assigned" is accepted for backward compatibility.
 // sprintId=unscheduled -> Mode "unscheduled" (sprint_id IS NULL).
 // sprintId=<number> -> project-local sprint number (resolved inline by board queries).
 // Returns error for invalid values (caller should respond 400).
-func (s *Server) parseSprintFilterFromQuery(r *http.Request, projectID int64) (store.SprintFilter, error) {
+func (s *Server) parseSprintFilterFromQuery(r *http.Request) (store.SprintFilter, error) {
 	v := r.URL.Query().Get("sprintId")
 	if v == "" {
 		return store.SprintFilter{Mode: "none"}, nil

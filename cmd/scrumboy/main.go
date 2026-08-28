@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "time/tzdata" // embed IANA zone database for minimal runtimes (e.g. Alpine) without system tzdata
+
 	"scrumboy/internal/agora"
 	"scrumboy/internal/config"
 	"scrumboy/internal/db"
@@ -21,6 +23,7 @@ import (
 	"scrumboy/internal/migrate"
 	"scrumboy/internal/oidc"
 	"scrumboy/internal/projectcolor"
+	"scrumboy/internal/publicorigin"
 	"scrumboy/internal/store"
 	"scrumboy/internal/tlsredirect"
 )
@@ -29,6 +32,13 @@ func main() {
 	cfg := config.FromEnv()
 
 	logger := log.New(os.Stdout, "", log.LstdFlags)
+	if len(os.Args) > 1 && os.Args[1] == "recover-owner" {
+		if err := runRecoverOwner(cfg, os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			logger.Printf("recover-owner failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	sqlDB, err := db.Open(cfg.DBPath, db.Options{
 		BusyTimeout: cfg.SQLiteBusyTimeout,
@@ -61,11 +71,31 @@ func main() {
 		logger.Printf("warning: invalid SCRUMBOY_ENCRYPTION_KEY ignored because no encrypted auth/security data exists; continuing with 2FA setup and password reset disabled until a valid key is configured")
 	}
 	encKey := keyResolution.Key
-	var storeOpts *store.StoreOptions
-	if len(encKey) > 0 {
-		storeOpts = &store.StoreOptions{EncryptionKey: encKey}
+	configuredOIDCIssuer := ""
+	if cfg.OIDCEnabled() {
+		configuredOIDCIssuer = cfg.OIDCIssuerCanonical
 	}
+	storeOpts := &store.StoreOptions{EncryptionKey: encKey, ConfiguredOIDCIssuer: configuredOIDCIssuer}
 	st := store.New(sqlDB, storeOpts)
+	if malformed, err := st.CountMalformedPasswordHashes(ctx); err != nil {
+		logger.Printf("warning: could not inspect local password hash health: %v", err)
+	} else if malformed > 0 {
+		logger.Printf("warning: %d user account(s) contain a malformed local password hash; those passwords are unusable until repaired through authenticated first-password setup or host-side recovery", malformed)
+	}
+	localAuthEnabled := !cfg.OIDCEnabled() || !cfg.OIDCLocalAuthDisabled
+	if posture, err := st.OwnerRecoveryPosture(ctx, localAuthEnabled, cfg.OIDCEnabled()); err != nil {
+		logger.Printf("warning: could not evaluate owner recovery posture: %v", err)
+	} else if posture.OwnerCount > 0 {
+		if posture.EffectiveOwnerCount == 0 {
+			logger.Printf("WARNING: no owner has an effective login method under the current authentication configuration. Existing sessions may remain temporarily usable. Stop the service, back up the database, use 'scrumboy recover-owner --email <owner>' and enable the required authentication method.")
+		} else if posture.EffectiveLocalOwners == 0 && posture.EffectiveSSOOwners > 0 {
+			if posture.ProviderOnlyOwners == posture.OwnerCount {
+				logger.Printf("warning: every owner relies exclusively on the configured external OIDC provider; establish at least one local owner recovery password to survive a provider outage")
+			} else {
+				logger.Printf("warning: no owner has effective local authentication; owner access currently depends on the configured external OIDC provider")
+			}
+		}
+	}
 
 	// One-time backfill: extract dominant colors for projects that have an image but still
 	// carry the migration default '#888888'. Runs at startup and is a no-op once complete.
@@ -87,12 +117,14 @@ func main() {
 		logger.Printf("OIDC enabled (issuer: %s)", cfg.OIDCIssuerCanonical)
 	}
 	logWebPushConfiguration(logger, cfg.ScrumboyMode, cfg.VAPIDPublicKey, cfg.VAPIDPrivateKey)
+	logSMTPConfiguration(logger, cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPFrom, cfg.SMTPPortExplicit, cfg.PublicBaseURL)
 
 	maxB := cfg.MaxRequestBodyBytes
 	if maxB <= 0 {
 		maxB = 1 << 20
 	}
-	mcpH := mcp.New(st, mcp.Options{Mode: cfg.ScrumboyMode})
+	publicOrigin := publicorigin.New(cfg.PublicBaseURL, cfg.TrustProxy)
+	mcpH := mcp.New(st, mcp.Options{Mode: cfg.ScrumboyMode, PublicOrigin: publicOrigin, Logger: logger})
 	srv := httpapi.NewServer(st, httpapi.Options{
 		Logger:               logger,
 		MaxRequestBody:       cfg.MaxRequestBodyBytes,
@@ -110,6 +142,16 @@ func main() {
 		WallEnabled:          cfg.WallEnabled,
 		MarkdownNotesEnabled: cfg.MarkdownNotesEnabled,
 		MermaidNotesEnabled:  cfg.MermaidNotesEnabled,
+		SMTPHost:             cfg.SMTPHost,
+		SMTPPort:             cfg.SMTPPort,
+		SMTPUsername:         cfg.SMTPUsername,
+		SMTPPassword:         cfg.SMTPPassword,
+		SMTPFrom:             cfg.SMTPFrom,
+		SMTPTLSMode:          cfg.SMTPTLSMode,
+		SMTPDebug:            cfg.SMTPDebug,
+		PublicBaseURL:        cfg.PublicBaseURL,
+		PublicOrigin:         publicOrigin,
+		TrustProxy:           cfg.TrustProxy,
 	})
 	st.SetTodoAssignedPublisher(srv.PublishTodoAssigned)
 
@@ -194,6 +236,12 @@ func main() {
 					logger.Printf("deleted %d expired projects", deleted)
 				}
 
+				if deletedOAuth, err := st.DeleteExpiredOAuthArtifacts(ctx); err != nil {
+					logger.Printf("cleanup expired oauth codes/tokens: %v", err)
+				} else if deletedOAuth > 0 {
+					logger.Printf("deleted %d expired/revoked oauth codes and tokens", deletedOAuth)
+				}
+
 				// WAL checkpoint to prevent unbounded WAL growth
 				// TRUNCATE mode: checkpoint and truncate WAL file
 				// This prevents the "week later it's slow" problem by keeping WAL small
@@ -219,7 +267,10 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("shutdown: %v", err)
 	}
-	srv.Close()
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer closeCancel()
+	srv.Close(closeCtx)
 }
 
 func logWebPushConfiguration(logger *log.Logger, mode, publicKey, privateKey string) {
@@ -234,5 +285,19 @@ func logWebPushConfiguration(logger *log.Logger, mode, publicKey, privateKey str
 		logger.Printf("web push: partial config ignored")
 	default:
 		logger.Printf("web push: disabled (set SCRUMBOY_VAPID_PUBLIC_KEY and SCRUMBOY_VAPID_PRIVATE_KEY)")
+	}
+}
+
+func logSMTPConfiguration(logger *log.Logger, host string, port int, from string, portExplicit bool, publicBaseURL string) {
+	switch {
+	case httpapi.SMTPConfigured(host, port, from):
+		logger.Printf("smtp: enabled (host=%s port=%d)", host, port)
+		if strings.TrimSpace(publicBaseURL) == "" {
+			logger.Printf("smtp: SCRUMBOY_PUBLIC_BASE_URL is missing or invalid; self-service password-reset emails are disabled until a valid public origin is configured (e.g. https://scrumboy.example.com)")
+		}
+	case httpapi.SMTPPartiallyConfigured(host, port, from, portExplicit):
+		logger.Printf("smtp: partial or invalid config ignored (set SCRUMBOY_SMTP_HOST and SCRUMBOY_SMTP_FROM; SCRUMBOY_SMTP_PORT defaults to 587 and, when set, must be between 1 and 65535)")
+	default:
+		logger.Printf("smtp: disabled (set SCRUMBOY_SMTP_HOST and SCRUMBOY_SMTP_FROM to enable password-reset emails; SCRUMBOY_SMTP_PORT defaults to 587 when omitted)")
 	}
 }

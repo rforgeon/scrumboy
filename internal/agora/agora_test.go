@@ -8,17 +8,32 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"scrumboy/internal/agora"
+	todoapp "scrumboy/internal/application/todo"
 	"scrumboy/internal/db"
 	"scrumboy/internal/httpapi"
 	"scrumboy/internal/mcp"
 	"scrumboy/internal/migrate"
 	"scrumboy/internal/store"
 )
+
+var agoraTestBearerTokens sync.Map
+
+type bindingMCPHandler struct {
+	http.Handler
+	bind func(todoapp.CreatorNotificationRequestPublisher)
+}
+
+func (h *bindingMCPHandler) BindCreatorNotificationRequestPublisher(publisher todoapp.CreatorNotificationRequestPublisher) {
+	h.bind(publisher)
+}
 
 func newAgoraTestServer(t *testing.T, mode string, withAgora bool) (*httptest.Server, *sql.DB, func()) {
 	t.Helper()
@@ -48,21 +63,49 @@ func newAgoraTestServer(t *testing.T, mode string, withAgora bool) (*httptest.Se
 	}
 	srv := httpapi.NewServer(st, opts)
 	ts := httptest.NewServer(srv)
+	if mode == "full" {
+		registerAgoraTestStaticToken(t, ts.URL, st)
+	}
 	return ts, sqlDB, func() {
 		ts.Close()
 		_ = sqlDB.Close()
 	}
 }
 
-func postRaw(t *testing.T, client *http.Client, url string, contentType string, body []byte) *http.Response {
+func registerAgoraTestStaticToken(t *testing.T, baseURL string, st *store.Store) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	user, err := st.BootstrapUser(context.Background(), "agora@example.com", "Password123!", "Agora Test")
+	if err != nil {
+		t.Fatalf("bootstrap Agora test user: %v", err)
+	}
+	_, token, _, err := st.CreateUserAPIToken(context.Background(), user.ID, nil)
+	if err != nil {
+		t.Fatalf("create Agora test token: %v", err)
+	}
+	agoraTestBearerTokens.Store(baseURL, token)
+	t.Cleanup(func() { agoraTestBearerTokens.Delete(baseURL) })
+}
+
+func authorizeAgoraTestRequest(req *http.Request) {
+	if req.Header.Get("Authorization") != "" {
+		return
+	}
+	baseURL := (&url.URL{Scheme: req.URL.Scheme, Host: req.URL.Host}).String()
+	if token, ok := agoraTestBearerTokens.Load(baseURL); ok {
+		req.Header.Set("Authorization", "Bearer "+token.(string))
+	}
+}
+
+func postRaw(t *testing.T, client *http.Client, targetURL string, contentType string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	authorizeAgoraTestRequest(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -73,7 +116,7 @@ func postRaw(t *testing.T, client *http.Client, url string, contentType string, 
 func TestAgora_MCPJSONRPCUnchangedWithAgoraWired(t *testing.T) {
 	t.Parallel()
 	const listBody = `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
-	const callBody = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"system.getCapabilities","arguments":{}}}`
+	const callBody = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"system_getCapabilities","arguments":{}}}`
 
 	ts1, _, c1 := newAgoraTestServer(t, "full", false)
 	defer c1()
@@ -153,7 +196,7 @@ func TestAgora_InvokeSuccessStructured(t *testing.T) {
 	ts, _, cleanup := newAgoraTestServer(t, "full", true)
 	defer cleanup()
 	cl := &http.Client{}
-	body := []byte(`{"tool":"system.getCapabilities","arguments":{}}`)
+	body := []byte(`{"tool":"system_getCapabilities","arguments":{}}`)
 	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", body)
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -183,7 +226,7 @@ func TestAgora_BearerPassthroughInvoke(t *testing.T) {
 	ts, _, cleanup := newAgoraTestServer(t, "full", true)
 	defer cleanup()
 	cl := &http.Client{}
-	body := []byte(`{"tool":"projects.list","arguments":{}}`)
+	body := []byte(`{"tool":"projects_list","arguments":{}}`)
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/agora/v1/invoke", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +238,7 @@ func TestAgora_BearerPassthroughInvoke(t *testing.T) {
 	_ = rA.Body.Close()
 
 	req2, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp/rpc", bytes.NewReader([]byte(
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects_list","arguments":{}}}`,
 	)))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("Authorization", "Bearer sb_invalidtoken_for_apitest_xxx")
@@ -203,33 +246,73 @@ func TestAgora_BearerPassthroughInvoke(t *testing.T) {
 	bB, _ := io.ReadAll(rB.Body)
 	_ = rB.Body.Close()
 
-	var aMap, bMap map[string]any
+	var aMap map[string]any
 	if err := json.Unmarshal(bA, &aMap); err != nil {
 		t.Fatalf("adapter body: %v", err)
 	}
-	if err := json.Unmarshal(bB, &bMap); err != nil {
-		t.Fatalf("mcp body: %v", err)
+	if rA.StatusCode != http.StatusUnauthorized || rB.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status adapter=%d mcp=%d, want 401", rA.StatusCode, rB.StatusCode)
 	}
 	if aMap["ok"] != false {
 		t.Fatalf("adapter expected ok false, got %v", aMap["ok"])
 	}
-	resB, _ := bMap["result"].(map[string]any)
-	if resB == nil || resB["isError"] != true {
-		t.Fatalf("mcp expected tool isError, got %v", bMap)
+	if len(bB) != 0 {
+		t.Fatalf("MCP 401 body = %q, want empty", bB)
 	}
 	ae, _ := aMap["error"].(map[string]any)
-	if ae == nil || ae["message"] == nil {
+	if ae == nil || ae["message"] != "authentication required" {
 		t.Fatalf("adapter error shape: %v", aMap)
 	}
-	cB, _ := resB["content"].([]any)
-	if len(cB) < 1 {
-		t.Fatalf("mcp content: %v", bMap)
+	if aChallenge, mcpChallenge := rA.Header.Get("WWW-Authenticate"), rB.Header.Get("WWW-Authenticate"); aChallenge != "" || mcpChallenge == "" {
+		t.Fatalf("challenge adapter=%q mcp=%q", aChallenge, mcpChallenge)
 	}
-	cb0, _ := cB[0].(map[string]any)
-	tb, _ := cb0["text"].(string)
-	aa, _ := ae["message"].(string)
-	if tb != aa {
-		t.Fatalf("message mismatch adapter %q vs mcp text %q", aa, tb)
+}
+
+func TestAgora_DoesNotAcceptMCPResourceOAuthToken(t *testing.T) {
+	t.Parallel()
+	ts, sqlDB, cleanup := newAgoraTestServer(t, "full", true)
+	defer cleanup()
+	st := store.New(sqlDB, nil)
+	user, err := st.GetUserByEmail(context.Background(), "agora@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := st.CreateOAuthClient(context.Background(), "agora-boundary", "Agora Boundary", "http://127.0.0.1/callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := st.IssueOAuthTokenPair(context.Background(), client.ID, user.ID, ts.URL+"/mcp/rpc")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rpcBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	rpcReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp/rpc", bytes.NewReader(rpcBody))
+	rpcReq.Header.Set("Content-Type", "application/json")
+	rpcReq.Header.Set("Accept", "application/json, text/event-stream")
+	rpcReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	rpcResp, err := http.DefaultClient.Do(rpcReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, rpcResp.Body)
+	_ = rpcResp.Body.Close()
+	if rpcResp.StatusCode != http.StatusOK {
+		t.Fatalf("direct MCP OAuth status = %d, want 200", rpcResp.StatusCode)
+	}
+
+	agoraBody := []byte(`{"tool":"projects_list","arguments":{}}`)
+	agoraReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/agora/v1/invoke", bytes.NewReader(agoraBody))
+	agoraReq.Header.Set("Content-Type", "application/json")
+	agoraReq.Header.Set("Authorization", "Bearer "+pair.AccessToken)
+	agoraResp, err := http.DefaultClient.Do(agoraReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(agoraResp.Body)
+	_ = agoraResp.Body.Close()
+	if agoraResp.StatusCode != http.StatusUnauthorized || agoraResp.Header.Get("WWW-Authenticate") != "" {
+		t.Fatalf("Agora OAuth status=%d challenge=%q body=%s", agoraResp.StatusCode, agoraResp.Header.Get("WWW-Authenticate"), raw)
 	}
 }
 
@@ -248,10 +331,10 @@ func TestAgora_InvokeArgumentsNonObjectRejected(t *testing.T) {
 	defer ts.Close()
 	cl := &http.Client{}
 	cases := []string{
-		`{"tool":"system.getCapabilities","arguments":[]}`,
-		`{"tool":"system.getCapabilities","arguments":"x"}`,
-		`{"tool":"system.getCapabilities","arguments":123}`,
-		`{"tool":"system.getCapabilities","arguments":true}`,
+		`{"tool":"system_getCapabilities","arguments":[]}`,
+		`{"tool":"system_getCapabilities","arguments":"x"}`,
+		`{"tool":"system_getCapabilities","arguments":123}`,
+		`{"tool":"system_getCapabilities","arguments":true}`,
 	}
 	for _, raw := range cases {
 		resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(raw))
@@ -306,7 +389,7 @@ func TestAgora_InvokeTopLevelUnknownRejected(t *testing.T) {
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 	cl := &http.Client{}
-	bad := []byte(`{"tool":"system.getCapabilities","arguments":{},"metadata":{"x":1}}`)
+	bad := []byte(`{"tool":"system_getCapabilities","arguments":{},"metadata":{"x":1}}`)
 	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", bad)
 	b, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -343,8 +426,9 @@ func TestAgora_InvokeArgumentsPassThrough(t *testing.T) {
 	h := agora.New(wrap, agora.Options{MaxRequestBytes: 1 << 20})
 	ts := httptest.NewServer(h)
 	defer ts.Close()
+	registerAgoraTestStaticToken(t, ts.URL, st)
 	cl := &http.Client{}
-	invokeBody := `{"tool":"system.getCapabilities","arguments":{"unusedKey":1}}`
+	invokeBody := `{"tool":"system_getCapabilities","arguments":{"unusedKey":1}}`
 	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(invokeBody))
 	_, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -464,7 +548,7 @@ func TestAgora_InvokeMissingArgumentsKey(t *testing.T) {
 	ts, _, cleanup := newAgoraTestServer(t, "full", true)
 	defer cleanup()
 	cl := &http.Client{}
-	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(`{"tool":"system.getCapabilities"}`))
+	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(`{"tool":"system_getCapabilities"}`))
 	b, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -488,7 +572,7 @@ func TestAgora_InvokeArgumentsJSONNullNormalizes(t *testing.T) {
 	ts, _, cleanup := newAgoraTestServer(t, "full", true)
 	defer cleanup()
 	cl := &http.Client{}
-	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(`{"tool":"system.getCapabilities","arguments":null}`))
+	resp := postRaw(t, cl, ts.URL+"/agora/v1/invoke", "application/json", []byte(`{"tool":"system_getCapabilities","arguments":null}`))
 	b, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -606,6 +690,7 @@ func TestAgora_DiscoverWhitespaceBodyOK(t *testing.T) {
 	defer cleanup()
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/agora/v1/discover", bytes.NewBufferString("   \n\t  "))
 	req.Header.Set("Content-Type", "application/json")
+	authorizeAgoraTestRequest(req)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -639,12 +724,23 @@ func TestAgora_CookiePassthroughParity(t *testing.T) {
 	}
 	defer func() { _ = sqlDB.Close() }()
 	st := store.New(sqlDB, nil)
+	user, err := st.BootstrapUser(context.Background(), "cookie@example.com", "Password123!", "Cookie Test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionToken, _, err := st.CreateSession(context.Background(), user.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mcpH := mcp.New(st, mcp.Options{Mode: "full"})
 	var seen []string
-	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen = append(seen, r.Header.Get("Cookie"))
-		mcpH.ServeHTTP(w, r)
-	})
+	wrapped := &bindingMCPHandler{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = append(seen, r.Header.Get("Cookie"))
+			mcpH.ServeHTTP(w, r)
+		}),
+		bind: mcpH.BindCreatorNotificationRequestPublisher,
+	}
 	srv := httpapi.NewServer(st, httpapi.Options{
 		MaxRequestBody: 1 << 20,
 		ScrumboyMode:   "full",
@@ -654,20 +750,32 @@ func TestAgora_CookiePassthroughParity(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	cl := &http.Client{}
-	const want = "scrumboy_session=cookie-passthrough-parity"
-	r1, _ := http.NewRequest(http.MethodPost, ts.URL+"/agora/v1/invoke", bytes.NewBufferString(`{"tool":"system.getCapabilities","arguments":{}}`))
+	want := "scrumboy_session=" + sessionToken
+	r1, _ := http.NewRequest(http.MethodPost, ts.URL+"/agora/v1/invoke", bytes.NewBufferString(`{"tool":"system_getCapabilities","arguments":{}}`))
 	r1.Header.Set("Content-Type", "application/json")
 	r1.Header.Set("Cookie", want)
-	if _, err := cl.Do(r1); err != nil {
+	resp1, err := cl.Do(r1)
+	if err != nil {
 		t.Fatal(err)
 	}
+	_, _ = io.Copy(io.Discard, resp1.Body)
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("Agora cookie status = %d, want 200", resp1.StatusCode)
+	}
 	r2, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp/rpc", bytes.NewBufferString(
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"system.getCapabilities","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"system_getCapabilities","arguments":{}}}`,
 	))
 	r2.Header.Set("Content-Type", "application/json")
 	r2.Header.Set("Cookie", want)
-	if _, err := cl.Do(r2); err != nil {
+	resp2, err := cl.Do(r2)
+	if err != nil {
 		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("MCP cookie status = %d, want 200", resp2.StatusCode)
 	}
 	if len(seen) != 2 {
 		t.Fatalf("expected 2 handler calls, got %d %v", len(seen), seen)

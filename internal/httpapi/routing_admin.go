@@ -1,11 +1,14 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
+	useradminapp "scrumboy/internal/application/useradmin"
 	"scrumboy/internal/auth/tokens"
 	"scrumboy/internal/store"
 )
@@ -20,8 +23,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rest []stri
 	// | Promote admin -> owner | ❌     | ❌     | ❌    |
 	// | Delete user           | ✅     | ❌     | ❌    |
 	// | Demote admin          | ✅     | ❌     | ❌    |
-	// Note: All authorization checks are enforced in store layer, not routing.
-	// Routing only wires requests to store methods.
+	// Store remains authoritative for mutation-time Owner and persistence
+	// invariants. Selected create, role, and deletion orchestration delegates
+	// through internal/application/useradmin after this shared transport gate.
 	ctx := s.requestContext(r)
 	userID, ok := store.UserIDFromContext(ctx)
 	if !ok {
@@ -51,16 +55,28 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rest []stri
 			s.handleAdminUsersListOrCreate(w, r, userID)
 		} else if len(rest) == 3 && rest[2] == "role" {
 			// PATCH /api/admin/users/{id}/role
-			s.handleAdminUsersUpdateRole(w, r, userID, rest[1])
+			s.handleAdminUsersUpdateRole(w, r, rest[1])
 		} else if len(rest) == 3 && rest[2] == "password-reset" {
 			// POST /api/admin/users/{id}/password-reset
 			s.handleAdminUsersPasswordReset(w, r, userID, rest[1])
 		} else if len(rest) == 2 {
 			// DELETE /api/admin/users/{id}
-			s.handleAdminUsersDelete(w, r, userID, rest[1])
+			s.handleAdminUsersDelete(w, r, rest[1])
 		} else {
 			writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
 		}
+		return
+	}
+
+	if rest[0] == "settings" && len(rest) == 2 && rest[1] == "email-notify-default" {
+		// GET/PUT /api/admin/settings/email-notify-default
+		s.handleAdminEmailNotifyDefault(w, r, userID)
+		return
+	}
+
+	if rest[0] == "settings" && len(rest) == 2 && rest[1] == "default-board" {
+		// GET/PUT/DELETE /api/admin/settings/default-board
+		s.handleAdminDefaultBoard(w, r, userID)
 		return
 	}
 
@@ -95,7 +111,11 @@ func (s *Server) handleAdminUsersListOrCreate(w http.ResponseWriter, r *http.Req
 			return
 		}
 
-		u, err := s.store.CreateUser(ctx, in.Email, in.Password, in.Name)
+		u, err := s.userCreations.Create(ctx, useradminapp.CreateCommand{
+			Email:    in.Email,
+			Name:     in.Name,
+			Password: in.Password,
+		})
 		if err != nil {
 			writeStoreErr(w, err, false)
 			return
@@ -108,7 +128,7 @@ func (s *Server) handleAdminUsersListOrCreate(w http.ResponseWriter, r *http.Req
 	}
 }
 
-func (s *Server) handleAdminUsersUpdateRole(w http.ResponseWriter, r *http.Request, requesterID int64, targetIDStr string) {
+func (s *Server) handleAdminUsersUpdateRole(w http.ResponseWriter, r *http.Request, targetIDStr string) {
 	if r.Method != http.MethodPatch {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
@@ -140,13 +160,20 @@ func (s *Server) handleAdminUsersUpdateRole(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if err := s.store.UpdateUserRole(ctx, requesterID, targetID, newRole); err != nil {
-		writeStoreErr(w, err, false)
+	prepared, err := s.userRoleMutations.Prepare(ctx, useradminapp.RoleChangeCommand{
+		TargetUserID: targetID,
+		NewRole:      newRole,
+	})
+	if err != nil {
+		if errors.Is(err, useradminapp.ErrActorRequired) {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			return
+		}
+		writeInternal(w, err)
 		return
 	}
 
-	// Return updated user
-	u, err := s.store.GetUser(ctx, targetID)
+	u, err := prepared.Update()
 	if err != nil {
 		writeStoreErr(w, err, false)
 		return
@@ -155,7 +182,7 @@ func (s *Server) handleAdminUsersUpdateRole(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, userToJSON(u))
 }
 
-func (s *Server) handleAdminUsersDelete(w http.ResponseWriter, r *http.Request, requesterID int64, targetIDStr string) {
+func (s *Server) handleAdminUsersDelete(w http.ResponseWriter, r *http.Request, targetIDStr string) {
 	if r.Method != http.MethodDelete {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
@@ -168,7 +195,19 @@ func (s *Server) handleAdminUsersDelete(w http.ResponseWriter, r *http.Request, 
 	}
 
 	ctx := s.requestContext(r)
-	if err := s.store.DeleteUser(ctx, requesterID, targetID); err != nil {
+	prepared, err := s.userDeletions.Prepare(ctx, useradminapp.DeleteCommand{
+		TargetUserID: targetID,
+	})
+	if err != nil {
+		if errors.Is(err, useradminapp.ErrActorRequired) {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			return
+		}
+		writeInternal(w, err)
+		return
+	}
+
+	if err := prepared.Delete(); err != nil {
 		writeStoreErr(w, err, false)
 		return
 	}
@@ -177,6 +216,10 @@ func (s *Server) handleAdminUsersDelete(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleAdminUsersPasswordReset(w http.ResponseWriter, r *http.Request, requesterID int64, targetIDStr string) {
+	if s.oidcService != nil && s.oidcService.Config().LocalAuthDisabled {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
@@ -241,19 +284,154 @@ func (s *Server) handleAdminUsersPasswordReset(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	proto := r.Header.Get("X-Forwarded-Proto")
-	if proto == "" {
-		if r.TLS != nil {
-			proto = "https"
-		} else {
-			proto = "http"
-		}
-	}
-	baseURL := proto + "://" + r.Host
-	resetURL := baseURL + "/auth/reset-password?token=" + url.QueryEscape(token)
+	resetURL := s.resetBaseURL(r) + "/auth/reset-password?token=" + url.QueryEscape(token)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"reset_url":  resetURL,
 		"expires_at": expiresAt.UTC().Format(time.RFC3339),
 	})
+}
+
+// handleAdminEmailNotifyDefault gets/sets the org-wide default emailNotifications
+// preference newly created users are seeded with. It never touches
+// existing users' own preferences -- see seedEmailNotifyPrefTx in internal/store.
+func (s *Server) handleAdminEmailNotifyDefault(w http.ResponseWriter, r *http.Request, requesterID int64) {
+	ctx := s.requestContext(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		// GET /api/admin/settings/email-notify-default
+		pref, customized, err := s.store.GetEmailNotifyOrgDefault(ctx)
+		if err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		canonical, err := json.Marshal(pref)
+		if err != nil {
+			writeInternal(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"value":      string(canonical),
+			"customized": customized,
+		})
+		return
+
+	case http.MethodPut:
+		// PUT /api/admin/settings/email-notify-default - Body: { value: string }
+		var in struct {
+			Value string `json:"value"`
+		}
+		if err := readJSON(w, r, s.maxBody, &in); err != nil {
+			return
+		}
+		if err := s.store.SetEmailNotifyOrgDefault(ctx, requesterID, in.Value); err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		pref, _, err := s.store.GetEmailNotifyOrgDefault(ctx)
+		if err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		canonical, err := json.Marshal(pref)
+		if err != nil {
+			writeInternal(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"value":      string(canonical),
+			"customized": true,
+		})
+		return
+
+	case http.MethodDelete:
+		// DELETE /api/admin/settings/email-notify-default - reset to unconfigured.
+		// Existing users' preferences are untouched; subsequent users get no seeded row.
+		if err := s.store.ClearEmailNotifyOrgDefault(ctx, requesterID); err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+	}
+}
+
+// handleAdminDefaultBoard gets/sets/clears the org-wide default board project
+// (and project role) new users are auto-enrolled into at creation time. It
+// never touches existing users' memberships -- see
+// seedDefaultBoardMembershipTx in internal/store.
+func (s *Server) handleAdminDefaultBoard(w http.ResponseWriter, r *http.Request, requesterID int64) {
+	ctx := s.requestContext(r)
+
+	switch r.Method {
+	case http.MethodGet:
+		// GET /api/admin/settings/default-board
+		projectID, role, customized, err := s.store.GetDefaultBoardOrgSetting(ctx)
+		if err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		resp := map[string]any{"customized": customized, "role": role.String()}
+		if customized {
+			resp["projectId"] = projectID
+		} else {
+			resp["projectId"] = nil
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+
+	case http.MethodPut:
+		// PUT /api/admin/settings/default-board - Body: { projectId: number, role?: string }
+		var in struct {
+			ProjectID int64   `json:"projectId"`
+			Role      *string `json:"role"`
+		}
+		if err := readJSON(w, r, s.maxBody, &in); err != nil {
+			return
+		}
+		var role store.ProjectRole
+		if in.Role == nil {
+			// Preserve an already-configured role when older clients omit it.
+			_, existingRole, _, err := s.store.GetDefaultBoardOrgSetting(ctx)
+			if err != nil {
+				writeStoreErr(w, err, false)
+				return
+			}
+			role = existingRole
+		} else {
+			role = store.ProjectRole(*in.Role)
+			if !store.IsValidProjectRole(role) {
+				writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "invalid role", nil)
+				return
+			}
+		}
+		if err := s.store.SetDefaultBoardOrgSetting(ctx, requesterID, in.ProjectID, role); err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"projectId":  in.ProjectID,
+			"role":       role.String(),
+			"customized": true,
+		})
+		return
+
+	case http.MethodDelete:
+		// DELETE /api/admin/settings/default-board - reset to unconfigured.
+		// Existing users' memberships are untouched; subsequent users get no
+		// seeded project_members row.
+		if err := s.store.ClearDefaultBoardOrgSetting(ctx, requesterID); err != nil {
+			writeStoreErr(w, err, false)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+	}
 }

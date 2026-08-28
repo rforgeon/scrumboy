@@ -12,6 +12,9 @@ import {
   getProjectView,
   getProjects,
   getUser,
+  getOidcEnabled,
+  getLocalAuthEnabled,
+  getSelfServicePasswordResetEnabled,
 } from '../state/selectors.js';
 import {
   setProjects,
@@ -20,15 +23,14 @@ import {
   setSettingsActiveTab,
 } from '../state/mutations.js';
 import { renderSettingsModal } from '../dialogs/settings.js';
+import { getBoardLimitPerLaneFloor } from '../orchestration/board-refresh.js';
+import { beginBoardPrefetch, takeResolvedPrefetchedBoard } from './board-prefetch-cache.js';
 import { CreateProjectPayload, Project, WorkflowLaneDraft } from '../types.js';
 
 // Symbol for idempotent listener attachment
 const BOUND_FLAG = Symbol('bound');
 declare const Sortable: any;
 
-// Board prefetch cache for Projects → Board navigation (hover to prefetch, click to use)
-const boardPrefetchPromises = new Map<string, Promise<Board>>();
-const resolvedBoardBySlug = new Map<string, Board>();
 const PREFETCH_DELAY_MS = 250;
 let projectsI18nBound = false;
 
@@ -349,10 +351,18 @@ function openWorkflowSetupModal(projectName: string): void {
 }
 
 // Declare renderAuth function (will be available after Step 3)
-declare function renderAuth(opts: { next: string; bootstrap?: boolean }): void;
+type RenderAuthOptions = {
+  next: string;
+  bootstrap?: boolean;
+  oidcEnabled?: boolean;
+  localAuthEnabled?: boolean;
+  selfServicePasswordResetEnabled?: boolean;
+};
+
+declare function renderAuth(opts: RenderAuthOptions): void;
 
 // Runtime access to renderAuth from auth view (after Step 3)
-async function getRenderAuth(): Promise<(opts: { next: string; bootstrap?: boolean }) => void> {
+async function getRenderAuth(): Promise<(opts: RenderAuthOptions) => void> {
   try {
     // @ts-ignore - auth.js will exist after Step 3
     const authModule = await import('./auth.js');
@@ -538,11 +548,9 @@ function renderProjectsContent(projects: Project[]): void {
         hoverSlug = slug;
         hoverTimeoutId = setTimeout(() => {
           hoverTimeoutId = null;
-          if (!boardPrefetchPromises.has(slug)) {
-            const p = apiFetch<Board>(`/api/board/${slug}?limitPerLane=20`);
-            boardPrefetchPromises.set(slug, p);
-            p.then((board) => resolvedBoardBySlug.set(slug, board)).catch(() => {});
-          }
+          beginBoardPrefetch(slug, () =>
+            apiFetch<Board>(`/api/board/${slug}?limitPerLane=${getBoardLimitPerLaneFloor(slug)}`)
+          );
         }, PREFETCH_DELAY_MS);
       });
       el.addEventListener("mouseleave", () => {
@@ -558,9 +566,8 @@ function renderProjectsContent(projects: Project[]): void {
         const slug = el.getAttribute("data-open");
         console.log("Project clicked, slug:", slug);
         if (slug) {
-          const board = resolvedBoardBySlug.get(slug);
+          const board = takeResolvedPrefetchedBoard(slug);
           if (board) {
-            resolvedBoardBySlug.delete(slug);
             navigate(`/${slug}`, { state: { boardData: board } });
           } else {
             navigate(`/${slug}`);
@@ -678,7 +685,12 @@ export async function renderProjects(): Promise<void> {
   } catch (err: any) {
     if (err && err.status === 401) {
       const renderAuth = await getRenderAuth();
-      renderAuth({ next: "/" });
+      renderAuth({
+        next: "/",
+        oidcEnabled: getOidcEnabled(),
+        localAuthEnabled: getLocalAuthEnabled(),
+        selfServicePasswordResetEnabled: getSelfServicePasswordResetEnabled(),
+      });
       return;
     }
     throw err;

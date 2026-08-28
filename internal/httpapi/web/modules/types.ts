@@ -2,6 +2,8 @@
 // Types reflect current runtime reality, not desired future shape
 
 // Union types for string literals
+export const NO_PRIORITY_FILTER_VALUE = '**none**';
+
 export type TodoStatus = string;
 export type ProjectView = 'list' | 'grid';
 export type RouteName = 'projects' | 'dashboard' | 'boardBySlug' | 'reset-password' | 'notfound';
@@ -18,15 +20,31 @@ export interface Todo {
   tags?: string[];
   estimationPoints?: number | null;
   assigneeUserId?: number | null;
+  createdByUserId?: number | null;
   sprintId?: number | null;
+  priorityKey?: string | null;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export interface PriorityTier {
+  key: string;
+  name: string;
+  color: string;
+  position: number;
 }
 
 export interface Tag {
   name: string;
   color?: string;
   count: number;
+  // tagId is present only for board-scoped tags; grouped personal labels omit it.
+  tagId?: number;
+  // deleteScope is "mine", "project", or "none"; canDelete is a compatibility alias.
+  deleteScope?: 'mine' | 'project' | 'none';
+  canDelete?: boolean;
+  // false for durable board-scoped tags when the viewer cannot change shared tags.color.
+  canUpdateColor?: boolean;
 }
 
 export interface Project {
@@ -35,6 +53,7 @@ export interface Project {
   image?: string;
   dominantColor: string;
   defaultSprintWeeks?: number;
+  sprintsEnabled?: boolean;
   estimationMode?: string;
   expiresAt?: string; // ISO date string for temporary boards
   creatorUserId?: number; // NULL for anonymous temp boards
@@ -43,12 +62,38 @@ export interface Project {
   role?: string;
 }
 
+export interface AgendaEvent {
+  id: string;
+  sourceId: number;
+  calendarName: string;
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
+  location: string;
+  provider: string;
+  hostKind?: string;
+}
+
+export interface Agenda {
+  enabled: boolean;
+  timezone?: string;
+  title?: string;
+  color?: string;
+  stale?: boolean;
+  fetchedAt?: string | null;
+  error?: string | null;
+  events?: AgendaEvent[];
+}
+
 export interface Board {
   project: Project;
   tags: Tag[];
   columnOrder?: Array<{ key: string; name: string; color?: string; isDone: boolean; position?: number }>;
+  priorityOrder?: PriorityTier[];
   columns: Record<string, Todo[]>;
   columnsMeta?: Record<string, { hasMore: boolean; nextCursor: string | null; totalCount?: number }>;
+  agenda?: Agenda;
 }
 
 export interface LanePageResponse {
@@ -65,6 +110,8 @@ export interface User {
   isBootstrap?: boolean;
   systemRole?: string;
   twoFactorEnabled?: boolean;
+  hasLocalPassword?: boolean;
+  oidcLinked?: boolean;
 }
 
 export interface ActiveSprintInfo {
@@ -146,6 +193,7 @@ export interface DashboardTodo {
   projectDominantColor: string;
   estimationPoints?: number | null;
   sprintId?: number | null;
+  priorityKey?: string | null;
   status: TodoStatus;
   statusName: string;
   statusColor: string;
@@ -157,12 +205,47 @@ export interface DashboardTodosResponse {
   nextCursor?: string;
 }
 
+export type WebPushState = 'enabled' | 'not_configured' | 'invalid' | 'unavailable';
+
+export type WebPushReason =
+  | 'invalid_subscriber'
+  | 'invalid_vapid_public_key'
+  | 'invalid_vapid_private_key'
+  | 'initialization_failed';
+
+export interface WebPushStatus {
+  state: WebPushState;
+  reason: WebPushReason | null;
+}
+
+export interface EmailNotifyPref {
+  v: 2;
+  enabled: boolean;
+  assigned: boolean;
+  createdByMe: boolean;
+  cardActivity: boolean;
+  sprintActivity: boolean;
+  projectActivity: boolean;
+  addedToProject: boolean;
+}
+
+export type EmailNotifyPreferenceStatus = 'idle' | 'loading' | 'ready' | 'saving' | 'error';
+
+export interface EmailNotifyPreferenceState {
+  userId: number | null;
+  status: EmailNotifyPreferenceStatus;
+  value: EmailNotifyPref | null;
+}
+
 // API-specific response shapes
 export interface AuthStatusResponse {
   user?: User | null;
   bootstrapAvailable?: boolean;
   mode?: 'anonymous' | 'full';
   pushConfigured?: boolean;
+  push?: WebPushStatus;
+  selfServicePasswordResetEnabled?: boolean;
+  emailNotifyAvailable?: boolean;
   oidcEnabled?: boolean;
   localAuthEnabled?: boolean;
   wallEnabled?: boolean;

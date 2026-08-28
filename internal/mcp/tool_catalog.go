@@ -10,18 +10,43 @@ type mcpToolDef struct {
 // toolCatalogDefinitions holds MCP metadata for every callable tool.
 func toolCatalogDefinitions() map[string]mcpToolDef {
 	return map[string]mcpToolDef{
-		"system.getCapabilities": {
-			Name:        "system.getCapabilities",
+		"system_getCapabilities": {
+			Name:        "system_getCapabilities",
 			Description: "Return adapter capabilities, auth mode, and the list of implemented MCP tools.",
 			InputSchema: jsonSchema("object", map[string]any{}, nil),
 		},
-		"projects.list": {
-			Name:        "projects.list",
+		"projects_list": {
+			Name:        "projects_list",
 			Description: "List all projects visible to the authenticated user, with their role in each project.",
 			InputSchema: jsonSchema("object", map[string]any{}, nil),
 		},
-		"todos.create": {
-			Name:        "todos.create",
+		"projects_create": {
+			Name:        "projects_create",
+			Description: "Create a new project. The creating user becomes maintainer. Custom workflow columns are not set here; use the workflow_* tools afterward.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"name": jsonProp("string", "Project name"),
+			}, []string{"name"}),
+		},
+		"projects_update": {
+			Name:        "projects_update",
+			Description: "Update a project. Only the fields present in the patch object are changed. Requires maintainer or higher.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"patch": jsonObjectProp("Fields to update. Only included fields are changed.", map[string]any{
+					"name":               jsonProp("string", "New project name"),
+					"defaultSprintWeeks": jsonProp("integer", "Default sprint length in weeks (1 or 2)"),
+				}, nil),
+			}, []string{"projectSlug", "patch"}),
+		},
+		"projects_delete": {
+			Name:        "projects_delete",
+			Description: "Delete a project. Requires maintainer or higher. Anonymous temporary boards cannot be deleted this way.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+			}, []string{"projectSlug"}),
+		},
+		"todos_create": {
+			Name:        "todos_create",
 			Description: "Create a new todo item in a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug":      jsonProp("string", "Project identifier (slug)"),
@@ -32,22 +57,23 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"estimationPoints": jsonPropWithNull("integer", "Story points estimate"),
 				"sprintId":         jsonPropWithNull("integer", "Sprint ID to assign"),
 				"assigneeUserId":   jsonPropWithNull("integer", "User ID to assign"),
+				"priorityKey":      jsonPropWithNull("string", "Priority tier key to assign"),
 				"position": jsonObjectProp("Position hint within the target column", map[string]any{
 					"afterLocalId":  jsonPropWithNull("integer", "Place after this todo local ID"),
 					"beforeLocalId": jsonPropWithNull("integer", "Place before this todo local ID"),
 				}, nil),
 			}, []string{"projectSlug", "title"}),
 		},
-		"todos.get": {
-			Name:        "todos.get",
+		"todos_get": {
+			Name:        "todos_get",
 			Description: "Get a single todo by its project-scoped local ID.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"localId":     jsonProp("integer", "Project-scoped todo ID"),
 			}, []string{"projectSlug", "localId"}),
 		},
-		"todos.search": {
-			Name:        "todos.search",
+		"todos_search": {
+			Name:        "todos_search",
 			Description: "Search todo link targets in a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug":     jsonProp("string", "Project identifier (slug)"),
@@ -56,8 +82,8 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"excludeLocalIds": jsonArrayProp("integer", "Todo local IDs to exclude"),
 			}, []string{"projectSlug"}),
 		},
-		"todos.update": {
-			Name:        "todos.update",
+		"todos_update": {
+			Name:        "todos_update",
 			Description: "Update fields on an existing todo. Only the fields present in the patch object are changed.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
@@ -69,19 +95,20 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 					"estimationPoints": jsonPropWithNull("integer", "Story points estimate"),
 					"assigneeUserId":   jsonPropWithNull("integer", "Assignee user ID"),
 					"sprintId":         jsonPropWithNull("integer", "Sprint ID"),
+					"priorityKey":      jsonPropWithNull("string", "Priority tier key"),
 				}, nil),
 			}, []string{"projectSlug", "localId", "patch"}),
 		},
-		"todos.delete": {
-			Name:        "todos.delete",
+		"todos_delete": {
+			Name:        "todos_delete",
 			Description: "Delete a todo by its project-scoped local ID.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"localId":     jsonProp("integer", "Project-scoped todo ID"),
 			}, []string{"projectSlug", "localId"}),
 		},
-		"todos.move": {
-			Name:        "todos.move",
+		"todos_move": {
+			Name:        "todos_move",
 			Description: "Move a todo to another workflow column, optionally relative to a neighbor.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug":   jsonProp("string", "Project identifier (slug)"),
@@ -91,30 +118,57 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"beforeLocalId": jsonPropWithNull("integer", "Place before this todo local ID"),
 			}, []string{"projectSlug", "localId", "toColumnKey"}),
 		},
-		"sprints.list": {
-			Name:        "sprints.list",
+		"todos_linksList": {
+			Name:        "todos_linksList",
+			Description: "List the linked stories for a todo. Returns outbound links (edges where this todo is the source) and inbound links (edges where this todo is the target).",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"localId":     jsonProp("integer", "Project-scoped todo ID"),
+			}, []string{"projectSlug", "localId"}),
+		},
+		"todos_linkAdd": {
+			Name:        "todos_linkAdd",
+			Description: "Link a todo to another todo (a \"linked story\"). The edge is directed from localId to targetLocalId, and the type describes localId as the subject: for blocks, localId blocks targetLocalId; for parent, localId is the parent of targetLocalId; for duplicates, localId duplicates targetLocalId; relates_to (the default) is a directed related-to edge with the same orientation.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug":   jsonProp("string", "Project identifier (slug)"),
+				"localId":       jsonProp("integer", "Project-scoped todo ID to link from (the subject of the link type)"),
+				"targetLocalId": jsonProp("integer", "Project-scoped todo ID to link to (the object of the link type)"),
+				"linkType":      jsonStringEnumProp("Link type describing localId as the subject: relates_to (default), blocks (localId blocks target), duplicates (localId duplicates target), or parent (localId is parent of target)", []string{"relates_to", "blocks", "duplicates", "parent"}),
+			}, []string{"projectSlug", "localId", "targetLocalId"}),
+		},
+		"todos_linkRemove": {
+			Name:        "todos_linkRemove",
+			Description: "Remove a linked story. Deletes only the directed edge from localId to targetLocalId (the same orientation used by todos_linkAdd); the reverse edge, if any, is left intact.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug":   jsonProp("string", "Project identifier (slug)"),
+				"localId":       jsonProp("integer", "Project-scoped todo ID to unlink from (link source)"),
+				"targetLocalId": jsonProp("integer", "Project-scoped todo ID to unlink (link target)"),
+			}, []string{"projectSlug", "localId", "targetLocalId"}),
+		},
+		"sprints_list": {
+			Name:        "sprints_list",
 			Description: "List sprints for a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 			}, []string{"projectSlug"}),
 		},
-		"sprints.get": {
-			Name:        "sprints.get",
+		"sprints_get": {
+			Name:        "sprints_get",
 			Description: "Get a sprint by ID within a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"sprintId":    jsonProp("integer", "Sprint ID"),
 			}, []string{"projectSlug", "sprintId"}),
 		},
-		"sprints.getActive": {
-			Name:        "sprints.getActive",
+		"sprints_getActive": {
+			Name:        "sprints_getActive",
 			Description: "Get the currently active sprint for a project, if any.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 			}, []string{"projectSlug"}),
 		},
-		"sprints.create": {
-			Name:        "sprints.create",
+		"sprints_create": {
+			Name:        "sprints_create",
 			Description: "Create a new sprint in a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug":    jsonProp("string", "Project identifier (slug)"),
@@ -123,24 +177,24 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"plannedEndAt":   jsonProp("string", "Planned end timestamp in RFC3339 format"),
 			}, []string{"projectSlug", "name", "plannedStartAt", "plannedEndAt"}),
 		},
-		"sprints.activate": {
-			Name:        "sprints.activate",
+		"sprints_activate": {
+			Name:        "sprints_activate",
 			Description: "Activate a planned sprint.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"sprintId":    jsonProp("integer", "Sprint ID"),
 			}, []string{"projectSlug", "sprintId"}),
 		},
-		"sprints.close": {
-			Name:        "sprints.close",
+		"sprints_close": {
+			Name:        "sprints_close",
 			Description: "Close an active sprint.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"sprintId":    jsonProp("integer", "Sprint ID"),
 			}, []string{"projectSlug", "sprintId"}),
 		},
-		"sprints.update": {
-			Name:        "sprints.update",
+		"sprints_update": {
+			Name:        "sprints_update",
 			Description: "Update a sprint. Only the fields present in patch are changed.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
@@ -152,74 +206,79 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				}, nil),
 			}, []string{"projectSlug", "sprintId", "patch"}),
 		},
-		"sprints.delete": {
-			Name:        "sprints.delete",
+		"sprints_delete": {
+			Name:        "sprints_delete",
 			Description: "Delete a sprint from a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"sprintId":    jsonProp("integer", "Sprint ID"),
 			}, []string{"projectSlug", "sprintId"}),
 		},
-		"tags.listProject": {
-			Name:        "tags.listProject",
+		"tags_listProject": {
+			Name:        "tags_listProject",
 			Description: "List project-scoped tags and their counts.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 			}, []string{"projectSlug"}),
 		},
-		"tags.listMine": {
-			Name:        "tags.listMine",
+		"tags_listMine": {
+			Name:        "tags_listMine",
 			Description: "List the signed-in user's personal tag library.",
 			InputSchema: jsonSchema("object", map[string]any{}, nil),
 		},
-		"tags.updateMineColor": {
-			Name:        "tags.updateMineColor",
+		"tags_updateMineColor": {
+			Name:        "tags_updateMineColor",
 			Description: "Set or clear the current user's color preference for a personal tag.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"tagId": jsonProp("integer", "Tag ID"),
 				"color": jsonPropWithNull("string", "Color value; null clears the preference"),
 			}, []string{"tagId"}),
 		},
-		"tags.deleteMine": {
-			Name:        "tags.deleteMine",
+		"tags_deleteMine": {
+			Name:        "tags_deleteMine",
 			Description: "Delete a personal tag.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"tagId": jsonProp("integer", "Tag ID"),
 			}, []string{"tagId"}),
 		},
-		"tags.updateProjectColor": {
-			Name:        "tags.updateProjectColor",
-			Description: "Set or clear the project-scoped color for a tag.",
+		"tags_updateProjectColor": {
+			Name: "tags_updateProjectColor",
+			Description: "Set or clear color for a tag in a project. Provide exactly one of tagId or tagName. " +
+				"tagName targets a grouped personal label on a durable project and sets only the caller's own " +
+				"display color (any authenticated project member); it is rejected on temporary boards, which " +
+				"list every tag row with a real tagId. tagId targets a board-scoped tag and updates the " +
+				"shared color for everyone (maintainer+). The tag must appear in that project's tags_listProject set.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
-				"tagId":       jsonProp("integer", "Tag ID"),
+				"tagId":       jsonProp("integer", "Board-scoped tag ID (mutually exclusive with tagName)"),
+				"tagName":     jsonProp("string", "Canonical tag name for a personal label on a durable project (mutually exclusive with tagId)"),
 				"color":       jsonPropWithNull("string", "Color value; null clears the color"),
-			}, []string{"projectSlug", "tagId"}),
+			}, []string{"projectSlug"}),
 		},
-		"tags.deleteProject": {
-			Name:        "tags.deleteProject",
+		"tags_deleteProject": {
+			Name:        "tags_deleteProject",
 			Description: "Delete a project-scoped tag.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"tagId":       jsonProp("integer", "Tag ID"),
 			}, []string{"projectSlug", "tagId"}),
 		},
-		"members.list": {
-			Name:        "members.list",
+		"members_list": {
+			Name:        "members_list",
 			Description: "List members of a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 			}, []string{"projectSlug"}),
 		},
-		"members.listAvailable": {
-			Name:        "members.listAvailable",
+		"members_listAvailable": {
+			Name:        "members_listAvailable",
 			Description: "List users who can be added to a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 			}, []string{"projectSlug"}),
 		},
-		"members.add": {
-			Name:        "members.add",
+		"members_add": {
+			Name:        "members_add",
 			Description: "Add a user to a project with the given role.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
@@ -227,8 +286,8 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"role":        jsonProp("string", "Project role"),
 			}, []string{"projectSlug", "userId", "role"}),
 		},
-		"members.updateRole": {
-			Name:        "members.updateRole",
+		"members_updateRole": {
+			Name:        "members_updateRole",
 			Description: "Change a project member's role.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
@@ -236,22 +295,26 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 				"role":        jsonProp("string", "Project role"),
 			}, []string{"projectSlug", "userId", "role"}),
 		},
-		"members.remove": {
-			Name:        "members.remove",
+		"members_remove": {
+			Name:        "members_remove",
 			Description: "Remove a user from a project.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"userId":      jsonProp("integer", "User ID"),
 			}, []string{"projectSlug", "userId"}),
 		},
-		"board.get": {
-			Name:        "board.get",
-			Description: "Get board columns and paginated todo items for a project board view.",
+		"board_get": {
+			Name:        "board_get",
+			Description: "Get board columns and paginated todo items for a project board view. Returned projectSlug fields use the stored canonical slug.",
 			InputSchema: jsonSchema("object", map[string]any{
 				"projectSlug": jsonProp("string", "Project identifier (slug)"),
 				"tag":         jsonProp("string", "Filter by tag"),
 				"search":      jsonProp("string", "Filter by search text"),
-				"sprintId":    jsonPropWithNull("integer", "Filter to a sprint"),
+				"assignee":    jsonProp("string", "Filter by \"me\", \"unassigned\", or a positive user ID encoded as a string"),
+				"priority":    jsonProp("string", "Filter by a priority tier key, or \"**none**\" for todos without a priority; omit for all priorities"),
+				"sort":        jsonStringEnumProp("Sort items within each lane by creation time: newest or oldest; omit for manual drag-rank order", []string{"newest", "oldest"}),
+				"sprintId":    jsonPropWithNull("integer", "Filter by the stored sprint row ID returned as sprintId by sprints_list; this is not the project-local sprint number returned as number"),
+				"columnKey":   jsonProp("string", "Restrict the response to a single workflow column key (as returned by workflow_list); other columns are omitted entirely instead of being queried and paginated"),
 				"limit":       jsonProp("integer", "Maximum items per column"),
 				"cursorByColumn": map[string]any{
 					"type":                 "object",
@@ -259,6 +322,123 @@ func toolCatalogDefinitions() map[string]mcpToolDef {
 					"additionalProperties": map[string]any{"type": "string"},
 				},
 			}, []string{"projectSlug"}),
+		},
+		"workflow_list": {
+			Name:        "workflow_list",
+			Description: "List a project's workflow columns (board lanes) in position order.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+			}, []string{"projectSlug"}),
+		},
+		"workflow_create": {
+			Name:        "workflow_create",
+			Description: "Add a new non-done workflow column (board lane) before the done column. Requires maintainer role or higher.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"name":        jsonProp("string", "Display name for the new column"),
+			}, []string{"projectSlug", "name"}),
+		},
+		"workflow_update": {
+			Name:        "workflow_update",
+			Description: "Update a workflow column's display name and color (both required). Requires maintainer role or higher.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"columnKey":   jsonProp("string", "Workflow column key to update"),
+				"name":        jsonProp("string", "New display name"),
+				"color":       jsonProp("string", "New color as a #RRGGBB hex value"),
+			}, []string{"projectSlug", "columnKey", "name", "color"}),
+		},
+		"workflow_delete": {
+			Name:        "workflow_delete",
+			Description: "Delete an empty non-done workflow column. Requires maintainer role or higher. Rejects the done column, non-empty columns, and deletes that would leave fewer than 2 columns.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"columnKey":   jsonProp("string", "Workflow column key to delete"),
+			}, []string{"projectSlug", "columnKey"}),
+		},
+		"priorities_list": {
+			Name:        "priorities_list",
+			Description: "List a project's priority tiers in position order.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+			}, []string{"projectSlug"}),
+		},
+		"priorities_create": {
+			Name:        "priorities_create",
+			Description: "Add a new priority tier, appended after the existing tiers. Requires maintainer role or higher.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"name":        jsonProp("string", "Display name for the new priority tier"),
+			}, []string{"projectSlug", "name"}),
+		},
+		"priorities_update": {
+			Name:        "priorities_update",
+			Description: "Update a priority tier's display name and color (both required). Requires maintainer role or higher.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"priorityKey": jsonProp("string", "Priority tier key to update"),
+				"name":        jsonProp("string", "New display name"),
+				"color":       jsonProp("string", "New color as a #RRGGBB hex value"),
+			}, []string{"projectSlug", "priorityKey", "name", "color"}),
+		},
+		"priorities_delete": {
+			Name:        "priorities_delete",
+			Description: "Delete an empty priority tier. Requires maintainer role or higher. Rejects non-empty tiers and deletes that would leave zero tiers.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"priorityKey": jsonProp("string", "Priority tier key to delete"),
+			}, []string{"projectSlug", "priorityKey"}),
+		},
+		"dashboard_getSummary": {
+			Name:        "dashboard_getSummary",
+			Description: "Get the signed-in user's cross-project dashboard summary: assigned work, completion metrics, WIP, and weekly throughput.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"timezone": jsonProp("string", "IANA timezone name used for calendar-week boundaries (for example America/New_York); defaults to UTC"),
+			}, nil),
+		},
+		"dashboard_listTodos": {
+			Name:        "dashboard_listTodos",
+			Description: "List todos assigned to the signed-in user across all projects, paginated.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"limit":  jsonPropWithNull("integer", "Maximum results to return (default 20, max 100)"),
+				"cursor": jsonPropWithNull("string", "Pagination cursor from a previous call"),
+				"sort":   jsonProp("string", "Sort order: activity (default) or board"),
+			}, nil),
+		},
+		"metrics_getBurndown": {
+			Name:        "metrics_getBurndown",
+			Description: "Get real burndown data (fixed scope from window start) for a project, or for a single sprint when sprintId is given.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+				"sprintId":    jsonPropWithNull("integer", "Sprint ID to scope the burndown to"),
+			}, []string{"projectSlug"}),
+		},
+		"metrics_getBacklogSize": {
+			Name:        "metrics_getBacklogSize",
+			Description: "Get backlog size data for a project (incomplete count and total scope over time).",
+			InputSchema: jsonSchema("object", map[string]any{
+				"projectSlug": jsonProp("string", "Project identifier (slug)"),
+			}, []string{"projectSlug"}),
+		},
+		"admin_listUsers": {
+			Name:        "admin_listUsers",
+			Description: "List all users on the system. Requires the owner or admin system role.",
+			InputSchema: jsonSchema("object", map[string]any{}, nil),
+		},
+		"admin_updateUserRole": {
+			Name:        "admin_updateUserRole",
+			Description: "Change a user's system role to admin or user. Requires the owner system role. Promotion to owner is not supported through this tool, and the last owner cannot be demoted.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"userId": jsonProp("integer", "User ID"),
+				"role":   jsonProp("string", "New system role: admin or user"),
+			}, []string{"userId", "role"}),
+		},
+		"admin_deleteUser": {
+			Name:        "admin_deleteUser",
+			Description: "Delete a user from the system. Requires the owner system role. A user cannot delete themselves, and the last owner cannot be deleted.",
+			InputSchema: jsonSchema("object", map[string]any{
+				"userId": jsonProp("integer", "User ID"),
+			}, []string{"userId"}),
 		},
 	}
 }
@@ -297,6 +477,16 @@ func jsonSchema(typ string, properties map[string]any, required []string) map[st
 
 func jsonProp(typ, description string) map[string]any {
 	return map[string]any{"type": typ, "description": description}
+}
+
+// jsonStringEnumProp builds a string property constrained to a fixed set of
+// allowed values, so MCP clients can constrain generation to valid inputs.
+func jsonStringEnumProp(description string, values []string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+		"enum":        values,
+	}
 }
 
 func jsonPropWithNull(typ, description string) map[string]any {

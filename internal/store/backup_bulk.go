@@ -81,6 +81,14 @@ func resolveImportAssignee(ctx context.Context, tx *sql.Tx, projectID int64, ass
 	return assigneeUserID
 }
 
+// resolveImportCreatedBy deliberately clears raw numeric creator IDs on import.
+// User IDs are database-local and a coincidental target row is not proof of
+// identity continuity. Export retains the additive field, but restoring it
+// requires a future portable-identity mapping contract.
+func resolveImportCreatedBy(_ context.Context, _ *sql.Tx, _ *int64) *int64 {
+	return nil
+}
+
 // generateUUID generates a simple UUID-like string for batch IDs.
 func generateUUID() string {
 	b := make([]byte, 16)
@@ -198,6 +206,10 @@ func insertProjectWithBatchID(ctx context.Context, tx *sql.Tx, pExport ProjectEx
 	if pExport.DefaultSprintWeeks == 1 || pExport.DefaultSprintWeeks == 2 {
 		defaultSprintWeeks = pExport.DefaultSprintWeeks
 	}
+	sprintsEnabled := true
+	if pExport.SprintsEnabled != nil {
+		sprintsEnabled = *pExport.SprintsEnabled
+	}
 
 	// Set creator_user_id for temporary boards (importing user becomes creator)
 	var creatorUserID *int64
@@ -210,9 +222,9 @@ func insertProjectWithBatchID(ctx context.Context, tx *sql.Tx, pExport ProjectEx
 
 	// Insert project with import_batch_id
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO projects(name, image, dominant_color, slug, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at, import_batch_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			pExport.Name, image, dominantColor, slug, EstimationModeModifiedFibonacci, defaultSprintWeeks, ownerUserID, creatorUserID, nowMs, expiresAtMs, createdAtMs, updatedAtMs, batchID)
+		INSERT INTO projects(name, image, dominant_color, slug, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at, import_batch_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		pExport.Name, image, dominantColor, slug, EstimationModeModifiedFibonacci, defaultSprintWeeks, boolToInt(sprintsEnabled), ownerUserID, creatorUserID, nowMs, expiresAtMs, createdAtMs, updatedAtMs, batchID)
 	if err != nil {
 		return 0, fmt.Errorf("insert project: %w", err)
 	}
@@ -357,6 +369,11 @@ func bulkInsertTodos(ctx context.Context, tx *sql.Tx, projectID int64, todos []T
 		if assigneeVal != nil {
 			assigneeForSQL = *assigneeVal
 		}
+		createdByVal := resolveImportCreatedBy(ctx, tx, tExport.CreatedByUserId)
+		var createdByForSQL any
+		if createdByVal != nil {
+			createdByForSQL = *createdByVal
+		}
 		doneAtForInsert := resolveImportDoneAt(tExport.DoneAt, status, updatedAtMs)
 
 		var sprintIDForSQL any
@@ -367,12 +384,18 @@ func bulkInsertTodos(ctx context.Context, tx *sql.Tx, projectID int64, todos []T
 				*warnings = append(*warnings, fmt.Sprintf("Sprint number %d for todo %q not found, using backlog", *tExport.SprintNumber, tExport.Title))
 			}
 		}
+		priorityForSQL := priorityKeyForInsert(tExport)
+		if key, ok := priorityForSQL.(string); ok {
+			if _, err := validateProjectPriorityKeyTx(ctx, tx, projectID, key); err != nil {
+				return nil, err
+			}
+		}
 
 		// Insert todo (schema uses column_key, not status)
 		res, err := tx.ExecContext(ctx, `
-			INSERT INTO todos(project_id, local_id, title, body, column_key, rank, estimation_points, assignee_user_id, sprint_id, created_at, updated_at, done_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			projectID, tExport.LocalID, tExport.Title, tExport.Body, columnKey, rank, estimationPoints, assigneeForSQL, sprintIDForSQL, createdAtMs, updatedAtMs, doneAtForInsert)
+			INSERT INTO todos(project_id, local_id, title, body, column_key, rank, estimation_points, assignee_user_id, created_by_user_id, sprint_id, priority_key, created_at, updated_at, done_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			projectID, tExport.LocalID, tExport.Title, tExport.Body, columnKey, rank, estimationPoints, assigneeForSQL, createdByForSQL, sprintIDForSQL, priorityForSQL, createdAtMs, updatedAtMs, doneAtForInsert)
 		if err != nil {
 			if strict {
 				return nil, fmt.Errorf("insert todo (strict mode): %w", err)
@@ -385,9 +408,9 @@ func bulkInsertTodos(ctx context.Context, tx *sql.Tx, projectID int64, todos []T
 				}
 				newLocalID := maxLocalID + 1
 				res, err = tx.ExecContext(ctx, `
-					INSERT INTO todos(project_id, local_id, title, body, column_key, rank, estimation_points, assignee_user_id, sprint_id, created_at, updated_at, done_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					projectID, newLocalID, tExport.Title, tExport.Body, columnKey, rank, estimationPoints, assigneeForSQL, sprintIDForSQL, createdAtMs, updatedAtMs, doneAtForInsert)
+					INSERT INTO todos(project_id, local_id, title, body, column_key, rank, estimation_points, assignee_user_id, created_by_user_id, sprint_id, priority_key, created_at, updated_at, done_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					projectID, newLocalID, tExport.Title, tExport.Body, columnKey, rank, estimationPoints, assigneeForSQL, createdByForSQL, sprintIDForSQL, priorityForSQL, createdAtMs, updatedAtMs, doneAtForInsert)
 				if err != nil {
 					return nil, fmt.Errorf("insert todo with regenerated local_id: %w", err)
 				}
@@ -433,19 +456,42 @@ func bulkUpsertTags(ctx context.Context, tx *sql.Tx, projectID int64, tags []Tag
 
 	nowMs := time.Now().UTC().UnixMilli()
 
-	// Get or create tags with user_id
-	for _, tagExport := range tags {
-		// Normalize tag name
-		normalized, err := normalizeTags([]string{tagExport.Name})
-		if err != nil {
-			return nil, fmt.Errorf("normalize tag %q: %w", tagExport.Name, err)
+	// Dedupe legacy backups that contain multiple entries for the same import key
+	// (older exports emitted one row per backing tag and could repeat a name with
+	// conflicting colors). First occurrence wins for identity; the first non-empty
+	// valid color among duplicates wins (deterministic, not last-write).
+	//
+	// Names use the same CanonicalizeTag rules as todo create/update ("make space"
+	// → "make-space"). Uncanonicalizable names fail the whole import.
+	dedupedIdx := make(map[string]int)
+	deduped := make([]TagExport, 0, len(tags))
+	for _, te := range tags {
+		key := CanonicalizeTag(te.Name)
+		if key == "" {
+			return nil, fmt.Errorf("%w: invalid tag name %q", ErrValidation, te.Name)
 		}
-		if len(normalized) == 0 {
-			continue // Skip invalid tags
+		var validColor *string
+		if te.Color != nil {
+			trimmed := strings.TrimSpace(*te.Color)
+			if colorHexRe.MatchString(trimmed) {
+				c := trimmed
+				validColor = &c
+			}
 		}
-		tagName := normalized[0]
+		if idx, ok := dedupedIdx[key]; ok {
+			if deduped[idx].Color == nil && validColor != nil {
+				deduped[idx].Color = validColor
+			}
+			continue
+		}
+		dedupedIdx[key] = len(deduped)
+		deduped = append(deduped, TagExport{Name: key, Color: validColor})
+	}
 
-		// Get or create tag with user_id
+	// Get or create tags with user_id (names already canonical from the dedupe pass).
+	for _, tagExport := range deduped {
+		tagName := tagExport.Name
+
 		tagID, err := GetOrCreateTag(ctx, tx, userID, tagName)
 		if err != nil {
 			return nil, fmt.Errorf("get or create tag %q: %w", tagName, err)
@@ -536,7 +582,7 @@ func bulkLinkTodoTags(ctx context.Context, tx *sql.Tx, todoTagMap map[int64][]st
 	const chunkSize = 100
 
 	for todoID, tagNames := range todoTagMap {
-		// Normalize tags
+		// Normalize tags (same CanonicalizeTag rules as todo create/update)
 		normalized, err := normalizeTags(tagNames)
 		if err != nil {
 			return fmt.Errorf("normalize tags for todo %d: %w", todoID, err)

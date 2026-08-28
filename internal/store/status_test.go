@@ -155,6 +155,9 @@ func TestMoveTodo_ToTesting(t *testing.T) {
 		if moved.ColumnKey != DefaultColumnDone {
 			t.Errorf("expected column Done, got %q", moved.ColumnKey)
 		}
+		if moved.MoveFromColumnName != "Testing" || moved.MoveToColumnName != "Done" {
+			t.Errorf("move transition names = %q → %q, want Testing → Done", moved.MoveFromColumnName, moved.MoveToColumnName)
+		}
 	})
 }
 
@@ -207,7 +210,7 @@ func TestGetBoard_IncludesTestingColumn(t *testing.T) {
 
 	// Get board
 	pc, _ := st.GetProjectContextForRead(ctx, p.ID, ModeFull)
-	_, _, _, cols, err := st.GetBoard(ctx, &pc, "", "", SprintFilter{Mode: "none"})
+	_, _, _, cols, err := st.GetBoard(ctx, &pc, "", "", AssigneeFilter{}, PriorityFilter{}, SprintFilter{Mode: "none"}, SortOrderDefault)
 	if err != nil {
 		t.Fatalf("GetBoard: %v", err)
 	}

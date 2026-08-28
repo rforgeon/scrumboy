@@ -1,4 +1,4 @@
-import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus } from '../types.js';
+import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus, WebPushStatus, EmailNotifyPreferenceState } from '../types.js';
 
 export interface BoardMember {
   userId: number;
@@ -31,6 +31,10 @@ export interface State {
   _authStatusChecked?: boolean;
   _bootstrapAvailable?: boolean;
   _pushConfigured?: boolean;
+  _pushStatus?: WebPushStatus | null;
+  _selfServicePasswordResetEnabled?: boolean;
+  _emailNotifyAvailable?: boolean;
+  emailNotifyPreference: EmailNotifyPreferenceState;
   _oidcEnabled?: boolean;
   _localAuthEnabled?: boolean;
   _wallEnabled?: boolean;
@@ -76,6 +80,7 @@ let _current: State = {
   projects: null,
   settingsProjectId: null,
   authStatusAvailable: false,
+  emailNotifyPreference: { userId: null, status: 'idle', value: null },
   boardMembers: [],
   trelloImportBtn: null,
   trelloImportData: null,

@@ -92,6 +92,87 @@ func (s *Store) CheckProjectRole(ctx context.Context, projectID int64, userID in
 	return nil
 }
 
+// CheckCanManageProject authorizes project-level update/delete.
+// Durable projects require Maintainer+; authenticated Temporary Boards require Temporary Board owner;
+// Anonymous Boards are immutable at the project level (ErrNotFound).
+func (s *Store) CheckCanManageProject(ctx context.Context, projectID int64, userID int64) error {
+	p, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	return s.checkCanManageProject(ctx, p, userID)
+}
+
+func (s *Store) checkCanManageProject(ctx context.Context, p Project, userID int64) error {
+	return s.checkProjectSettingsAuth(ctx, p, userID)
+}
+
+// checkProjectSettingsAuth enforces project-level setting mutations.
+// Durable Boards require Maintainer+; Temporary Boards require Temporary Board owner;
+// Anonymous Boards return ErrNotFound (rename uses a separate unauthenticated path in UpdateProjectName).
+func (s *Store) checkProjectSettingsAuth(ctx context.Context, p Project, userID int64) error {
+	if err := rejectIfExpiredTemporaryProject(p); err != nil {
+		return err
+	}
+	if isAnonymousTemporaryBoard(p) {
+		return ErrNotFound
+	}
+	if isTemporaryProject(p) {
+		if p.CreatorUserID == nil || *p.CreatorUserID != userID {
+			return ErrForbidden
+		}
+		return nil
+	}
+	hasMaintainer, err := s.userHasProjectRole(ctx, p.ID, userID, RoleMaintainer)
+	if err != nil {
+		return err
+	}
+	if hasMaintainer {
+		return nil
+	}
+	role, err := s.GetProjectRole(ctx, p.ID, userID)
+	if err != nil {
+		return err
+	}
+	if role != "" && role.HasMinimumRole(RoleViewer) {
+		return ErrForbidden
+	}
+	return ErrNotFound
+}
+
+func (s *Store) checkProjectSettingsAuthTx(ctx context.Context, tx *sql.Tx, p Project, userID int64) error {
+	if err := rejectIfExpiredTemporaryProject(p); err != nil {
+		return err
+	}
+	if isAnonymousTemporaryBoard(p) {
+		return ErrNotFound
+	}
+	if isTemporaryProject(p) {
+		if p.CreatorUserID == nil || *p.CreatorUserID != userID {
+			return ErrForbidden
+		}
+		return nil
+	}
+	enabled, err := authEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return nil
+	}
+	role, err := s.getProjectRoleTx(ctx, tx, p.ID, userID)
+	if err != nil {
+		return err
+	}
+	if role.HasMinimumRole(RoleMaintainer) {
+		return nil
+	}
+	if role.HasMinimumRole(RoleViewer) {
+		return ErrForbidden
+	}
+	return ErrNotFound
+}
+
 func (s *Store) getProjectForRead(ctx context.Context, projectID int64, mode Mode) (Project, error) {
 	p, err := s.getProject(ctx, projectID)
 	if err != nil {
@@ -161,7 +242,9 @@ func (s *Store) GetProjectContextForRead(ctx context.Context, projectID int64, m
 func (s *Store) buildProjectContext(ctx context.Context, p Project, mode Mode) (ProjectContext, error) {
 	pc := ProjectContext{Project: p}
 
-	// Temporary boards bypass ownership checks
+	// Expiring boards (Temporary Boards and Anonymous Boards) are link-shareable and bypass
+	// ownership/role checks while they remain temporary. Durable Projects fall through to the
+	// owner/member authorization below.
 	if p.ExpiresAt != nil {
 		if err := rejectIfExpiredTemporaryProject(p); err != nil {
 			return ProjectContext{}, err
@@ -208,7 +291,7 @@ func (s *Store) getProjectForWrite(ctx context.Context, projectID int64, mode Mo
 		return Project{}, err
 	}
 
-	// Temporary boards bypass role checks
+	// Expiring boards (Temporary Boards and Anonymous Boards) bypass role checks while temporary
 	if p.ExpiresAt != nil {
 		return p, nil
 	}
@@ -236,16 +319,19 @@ func (s *Store) getProjectForWrite(ctx context.Context, projectID int64, mode Mo
 	return p, nil
 }
 
-// isAnonymousTemporaryBoard checks if a project is an anonymous temporary board.
-// Anonymous temp boards are identified by: expires_at IS NOT NULL AND creator_user_id IS NULL.
-// These boards are immutable at the project level - only todo-level operations are allowed.
+// isAnonymousTemporaryBoard reports whether a project is an Anonymous Board: an expiring board
+// with no recorded creator (expires_at IS NOT NULL AND creator_user_id IS NULL). Anonymous
+// Boards are created by unauthenticated board creation (always in Anonymous Mode, and in Full
+// Mode when signed out). They are immutable at the project level - only todo-level operations
+// are allowed - and they are never claimable.
 func isAnonymousTemporaryBoard(p Project) bool {
 	return p.ExpiresAt != nil && p.CreatorUserID == nil
 }
 
-// isTemporaryProject is true for any link-expiring board (expires_at set): unowned anonymous temps
-// and FULL-mode temporary boards with a creator. Durable projects have ExpiresAt == nil.
-// Use this for "link collaboration" write paths; use isAnonymousTemporaryBoard for unowned-only semantics.
+// isTemporaryProject reports whether a project is any expiring board (expires_at set): both
+// Anonymous Boards (no creator) and Full Mode Temporary Boards (with a creator). Durable
+// Projects have ExpiresAt == nil. Use this for "link collaboration" write paths; use
+// isAnonymousTemporaryBoard for the creator-less (unclaimable) subset.
 func isTemporaryProject(p Project) bool {
 	return p.ExpiresAt != nil
 }
@@ -296,7 +382,7 @@ func (s *Store) ListProjects(ctx context.Context) ([]ProjectListEntry, error) {
 		// IMPORTANT: Anonymous temp boards (creator_user_id IS NULL) stay out of listings — including the membership branch below
 		// so orphan project_members rows cannot surface unowned paste boards in a user's project list.
 		rows, err = s.db.QueryContext(ctx, `
-SELECT p.id, p.name, p.image, p.slug, p.dominant_color, p.estimation_mode, p.default_sprint_weeks, p.owner_user_id, p.creator_user_id, p.last_activity_at, p.expires_at, p.created_at, p.updated_at,
+SELECT p.id, p.name, p.image, p.slug, p.dominant_color, p.estimation_mode, p.default_sprint_weeks, p.sprints_enabled, p.owner_user_id, p.creator_user_id, p.last_activity_at, p.expires_at, p.created_at, p.updated_at,
   CASE
     WHEN p.expires_at IS NOT NULL AND p.creator_user_id = ? THEN 'maintainer'
     ELSE (SELECT pm.role FROM project_members pm WHERE pm.project_id = p.id AND pm.user_id = ? LIMIT 1)
@@ -311,7 +397,7 @@ ORDER BY p.updated_at DESC, p.id DESC`, userID, userID, userID, userID, userID)
 	} else {
 		// Anonymous mode: no authenticated project listings - return empty result explicitly
 		rows, err = s.db.QueryContext(ctx, `
-SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at, '' AS role
+SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at, '' AS role
 FROM projects
 WHERE 1=0`)
 	}
@@ -329,9 +415,11 @@ WHERE 1=0`)
 		var creatorUserID sql.NullInt64
 		var image sql.NullString
 		var role string
-		if err := rows.Scan(&e.Project.ID, &e.Project.Name, &image, &e.Project.Slug, &e.Project.DominantColor, &e.Project.EstimationMode, &e.Project.DefaultSprintWeeks, &ownerUserID, &creatorUserID, &lastActivityAtMs, &expiresAtMs, &createdAtMs, &updatedAtMs, &role); err != nil {
+		var sprintsEnabled int
+		if err := rows.Scan(&e.Project.ID, &e.Project.Name, &image, &e.Project.Slug, &e.Project.DominantColor, &e.Project.EstimationMode, &e.Project.DefaultSprintWeeks, &sprintsEnabled, &ownerUserID, &creatorUserID, &lastActivityAtMs, &expiresAtMs, &createdAtMs, &updatedAtMs, &role); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
+		e.Project.SprintsEnabled = sprintsEnabled == 1
 		if image.Valid && image.String != "" {
 			e.Project.Image = &image.String
 		}
@@ -571,6 +659,9 @@ func (s *Store) CreateProjectWithWorkflow(ctx context.Context, name string, work
 			return Project{}, err
 		}
 	}
+	if err := s.ensureDefaultPriorityTiersTx(ctx, tx, id); err != nil {
+		return Project{}, err
+	}
 
 	actorUserID := ownerUserID
 	meta := map[string]any{"name": name, "is_anonymous": false}
@@ -589,6 +680,7 @@ func (s *Store) CreateProjectWithWorkflow(ctx context.Context, name string, work
 		DominantColor:      "#888888",
 		EstimationMode:     EstimationModeModifiedFibonacci,
 		DefaultSprintWeeks: 2,
+		SprintsEnabled:     true,
 		Slug:               slug,
 		OwnerUserID:        ownerUserID,
 		LastActivityAt:     time.UnixMilli(nowMs).UTC(),
@@ -606,57 +698,83 @@ func slugExistsTx(ctx context.Context, tx *sql.Tx, slug string) (bool, error) {
 	return exists, nil
 }
 
-func (s *Store) DeleteProject(ctx context.Context, projectID int64, userID int64) error {
+type DeletedProjectSnapshot struct {
+	ProjectID     int64
+	Name          string
+	MemberUserIDs []int64
+}
+
+func (s *Store) DeleteProject(ctx context.Context, projectID int64, userID int64) (DeletedProjectSnapshot, error) {
 	// Load project to check if it's an anonymous temp board
 	p, err := s.getProject(ctx, projectID)
 	if err != nil {
-		return err
+		return DeletedProjectSnapshot{}, err
 	}
 
 	// CRITICAL: Anonymous temporary boards are immutable at the project level.
 	// They can only be deleted by expiration, not by user action.
 	// Return ErrNotFound to avoid leaking existence of anonymous temp boards.
 	if isAnonymousTemporaryBoard(p) {
-		return ErrNotFound
+		return DeletedProjectSnapshot{}, ErrNotFound
 	}
 
-	if err := s.CheckProjectRole(ctx, projectID, userID, RoleMaintainer); err != nil {
-		return err
+	if err := s.checkCanManageProject(ctx, p, userID); err != nil {
+		return DeletedProjectSnapshot{}, err
 	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin delete project: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("begin delete project: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	var name string
 	if err := tx.QueryRowContext(ctx, `SELECT name FROM projects WHERE id = ?`, projectID).Scan(&name); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
+			return DeletedProjectSnapshot{}, ErrNotFound
 		}
-		return fmt.Errorf("get project name: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("get project name: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT user_id FROM project_members WHERE project_id = ? ORDER BY created_at, user_id`, projectID)
+	if err != nil {
+		return DeletedProjectSnapshot{}, fmt.Errorf("list deleted project members: %w", err)
+	}
+	var memberUserIDs []int64
+	for rows.Next() {
+		var memberUserID int64
+		if err := rows.Scan(&memberUserID); err != nil {
+			_ = rows.Close()
+			return DeletedProjectSnapshot{}, fmt.Errorf("scan deleted project member: %w", err)
+		}
+		memberUserIDs = append(memberUserIDs, memberUserID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return DeletedProjectSnapshot{}, fmt.Errorf("iterate deleted project members: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return DeletedProjectSnapshot{}, fmt.Errorf("close deleted project members: %w", err)
 	}
 	actorUserID := &userID
 	meta := map[string]any{"name": name}
 	if err := insertAuditEventTx(ctx, tx, projectID, actorUserID, "project_deleted", "project", &projectID, meta); err != nil {
-		return fmt.Errorf("audit project_deleted: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("audit project_deleted: %w", err)
 	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, projectID)
 	if err != nil {
-		return fmt.Errorf("delete project: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("delete project: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("rows affected delete project: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("rows affected delete project: %w", err)
 	}
 	if n == 0 {
-		return ErrNotFound
+		return DeletedProjectSnapshot{}, ErrNotFound
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit delete project: %w", err)
+		return DeletedProjectSnapshot{}, fmt.Errorf("commit delete project: %w", err)
 	}
-	return nil
+	return DeletedProjectSnapshot{ProjectID: projectID, Name: name, MemberUserIDs: memberUserIDs}, nil
 }
 
 // userCanCreateTagsInProject checks if user has access to create tags in a project.
@@ -744,7 +862,7 @@ func (s *Store) ensureProjectHasSlug(ctx context.Context, projectID int64, name 
 }
 
 func (s *Store) getProject(ctx context.Context, projectID int64) (Project, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
 	p, err := scanProject(row)
 	if err != nil {
 		return p, err
@@ -755,7 +873,7 @@ func (s *Store) getProject(ctx context.Context, projectID int64) (Project, error
 			return Project{}, fmt.Errorf("ensure slug: %w", err)
 		}
 		// Re-fetch project to get the newly generated slug
-		row = s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
+		row = s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
 		return scanProject(row)
 	}
 	return p, nil
@@ -771,12 +889,12 @@ func (s *Store) GetProjectBySlug(ctx context.Context, slug string) (Project, err
 		return Project{}, fmt.Errorf("%w: invalid slug", ErrValidation)
 	}
 	// Keep the scan shape consistent with scanProject().
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE slug=? AND import_batch_id IS NULL`, slug)
+	row := s.db.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE slug=? AND import_batch_id IS NULL`, slug)
 	return scanProject(row)
 }
 
 func getProjectTx(ctx context.Context, tx *sql.Tx, projectID int64, store *Store) (Project, error) {
-	row := tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
+	row := tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
 	p, err := scanProject(row)
 	if err != nil {
 		return p, err
@@ -789,7 +907,7 @@ func getProjectTx(ctx context.Context, tx *sql.Tx, projectID int64, store *Store
 			return Project{}, fmt.Errorf("ensure slug: %w", err)
 		}
 		// Re-fetch project to get the newly generated slug (using transaction)
-		row = tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
+		row = tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID)
 		return scanProject(row)
 	}
 	return p, nil
@@ -834,7 +952,7 @@ func (s *Store) userHasProjectRoleTx(ctx context.Context, tx *sql.Tx, projectID 
 }
 
 func (s *Store) getProjectForReadTx(ctx context.Context, tx *sql.Tx, projectID int64, mode Mode) (Project, error) {
-	p, err := getProjectTx(ctx, tx, projectID, s)
+	p, err := scanProject(tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID))
 	if err != nil {
 		return Project{}, err
 	}
@@ -916,12 +1034,14 @@ func scanProject(row projectRow) (Project, error) {
 	var ownerUserID sql.NullInt64
 	var creatorUserID sql.NullInt64
 	var image sql.NullString
-	if err := row.Scan(&p.ID, &p.Name, &image, &p.Slug, &p.DominantColor, &p.EstimationMode, &p.DefaultSprintWeeks, &ownerUserID, &creatorUserID, &lastActivityAtMs, &expiresAtMs, &createdAtMs, &updatedAtMs); err != nil {
+	var sprintsEnabled int
+	if err := row.Scan(&p.ID, &p.Name, &image, &p.Slug, &p.DominantColor, &p.EstimationMode, &p.DefaultSprintWeeks, &sprintsEnabled, &ownerUserID, &creatorUserID, &lastActivityAtMs, &expiresAtMs, &createdAtMs, &updatedAtMs); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Project{}, ErrNotFound
 		}
 		return Project{}, fmt.Errorf("get project: %w", err)
 	}
+	p.SprintsEnabled = sprintsEnabled == 1
 	if image.Valid && image.String != "" {
 		p.Image = &image.String
 	}
@@ -951,19 +1071,11 @@ func touchProject(ctx context.Context, tx *sql.Tx, projectID int64, nowMs int64)
 }
 
 func (s *Store) UpdateProjectImage(ctx context.Context, projectID int64, userID int64, image *string, dominantColor string) error {
-	// Load project to check if it's an anonymous temp board
 	p, err := s.getProject(ctx, projectID)
 	if err != nil {
 		return err
 	}
-
-	// CRITICAL: Anonymous temporary boards are immutable at the project level.
-	// Their image cannot be changed. Return ErrNotFound to avoid leaking existence.
-	if isAnonymousTemporaryBoard(p) {
-		return ErrNotFound
-	}
-
-	if err := s.CheckProjectRole(ctx, projectID, userID, RoleMaintainer); err != nil {
+	if err := s.checkProjectSettingsAuth(ctx, p, userID); err != nil {
 		return err
 	}
 
@@ -998,24 +1110,126 @@ func (s *Store) UpdateProjectImage(ctx context.Context, projectID int64, userID 
 	return nil
 }
 
+// UpdateProjectPatch applies one or more project field changes atomically.
+// Used by MCP projects_update; REST keeps separate name and sprint-weeks routes.
+type UpdateProjectPatch struct {
+	Name               *string
+	DefaultSprintWeeks *int
+}
+
+func (s *Store) UpdateProjectPatch(ctx context.Context, projectID int64, userID int64, patch UpdateProjectPatch) error {
+	if patch.Name == nil && patch.DefaultSprintWeeks == nil {
+		return fmt.Errorf("%w: empty patch", ErrValidation)
+	}
+
+	var trimmedName string
+	if patch.Name != nil {
+		trimmedName = strings.TrimSpace(*patch.Name)
+		if trimmedName == "" || len(trimmedName) > 200 {
+			return fmt.Errorf("%w: invalid project name", ErrValidation)
+		}
+	}
+	if patch.DefaultSprintWeeks != nil {
+		weeks := *patch.DefaultSprintWeeks
+		if weeks != 1 && weeks != 2 {
+			return fmt.Errorf("%w: defaultSprintWeeks must be 1 or 2", ErrValidation)
+		}
+	}
+
+	p, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	if err := s.checkCanManageProject(ctx, p, userID); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin update project patch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		fromName  string
+		fromWeeks int
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT name, default_sprint_weeks FROM projects WHERE id = ?`, projectID).Scan(&fromName, &fromWeeks); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("get project patch fields: %w", err)
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	actorUserID := &userID
+
+	if patch.Name != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET name = ?, updated_at = ? WHERE id = ?`, trimmedName, nowMs, projectID); err != nil {
+			return fmt.Errorf("update project name: %w", err)
+		}
+		meta := map[string]any{"from_name": fromName, "to_name": trimmedName}
+		if err := insertAuditEventTx(ctx, tx, projectID, actorUserID, "project_renamed", "project", &projectID, meta); err != nil {
+			return fmt.Errorf("audit project_renamed: %w", err)
+		}
+	}
+
+	if patch.DefaultSprintWeeks != nil {
+		weeks := *patch.DefaultSprintWeeks
+		if _, err := tx.ExecContext(ctx, `UPDATE projects SET default_sprint_weeks = ?, updated_at = ? WHERE id = ?`, weeks, nowMs, projectID); err != nil {
+			return fmt.Errorf("update project default sprint weeks: %w", err)
+		}
+		meta := map[string]any{"from_weeks": fromWeeks, "to_weeks": weeks}
+		if err := insertAuditEventTx(ctx, tx, projectID, actorUserID, "project_default_sprint_weeks_updated", "project", &projectID, meta); err != nil {
+			return fmt.Errorf("audit project_default_sprint_weeks_updated: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update project patch: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) UpdateProjectDefaultSprintWeeks(ctx context.Context, projectID int64, userID int64, weeks int) error {
-	if err := s.CheckProjectRole(ctx, projectID, userID, RoleMaintainer); err != nil {
+	p, err := s.getProject(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	if err := s.checkProjectSettingsAuth(ctx, p, userID); err != nil {
 		return err
 	}
 	if weeks != 1 && weeks != 2 {
 		return fmt.Errorf("%w: defaultSprintWeeks must be 1 or 2", ErrValidation)
 	}
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin update project default sprint weeks: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := applyDefaultSprintWeeksIfChangedTx(ctx, tx, projectID, userID, weeks); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update project default sprint weeks: %w", err)
+	}
+	return nil
+}
+
+func applyDefaultSprintWeeksIfChangedTx(ctx context.Context, tx *sql.Tx, projectID int64, userID int64, weeks int) error {
+	if weeks != 1 && weeks != 2 {
+		return fmt.Errorf("%w: defaultSprintWeeks must be 1 or 2", ErrValidation)
+	}
 	var fromWeeks int
 	if err := tx.QueryRowContext(ctx, `SELECT default_sprint_weeks FROM projects WHERE id = ?`, projectID).Scan(&fromWeeks); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("get project default_sprint_weeks: %w", err)
+	}
+	if fromWeeks == weeks {
+		return nil
 	}
 	nowMs := time.Now().UTC().UnixMilli()
 	if _, err := tx.ExecContext(ctx, `UPDATE projects SET default_sprint_weeks = ?, updated_at = ? WHERE id = ?`, weeks, nowMs, projectID); err != nil {
@@ -1026,8 +1240,62 @@ func (s *Store) UpdateProjectDefaultSprintWeeks(ctx context.Context, projectID i
 	if err := insertAuditEventTx(ctx, tx, projectID, actorUserID, "project_default_sprint_weeks_updated", "project", &projectID, meta); err != nil {
 		return fmt.Errorf("audit project_default_sprint_weeks_updated: %w", err)
 	}
+	return nil
+}
+
+// UpdateProjectSprintsEnabled toggles whether sprints are available for a project.
+func (s *Store) UpdateProjectSprintsEnabled(ctx context.Context, projectID int64, userID int64, enabled bool) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin update project sprints enabled: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE projects SET updated_at = updated_at WHERE id = ?`, projectID)
+	if err != nil {
+		return fmt.Errorf("lock project sprints enabled: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read project sprints enabled lock result: %w", err)
+	}
+	if affected == 0 {
+		return ErrNotFound
+	}
+	p, err := scanProject(tx.QueryRowContext(ctx, `SELECT id, name, image, slug, dominant_color, estimation_mode, default_sprint_weeks, sprints_enabled, owner_user_id, creator_user_id, last_activity_at, expires_at, created_at, updated_at FROM projects WHERE id=? AND import_batch_id IS NULL`, projectID))
+	if err != nil {
+		return err
+	}
+	if err := s.checkProjectSettingsAuthTx(ctx, tx, p, userID); err != nil {
+		return err
+	}
+	if err := applySprintsEnabledIfChangedTx(ctx, tx, projectID, userID, enabled); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit update project default sprint weeks: %w", err)
+		return fmt.Errorf("commit update project sprints enabled: %w", err)
+	}
+	return nil
+}
+
+func applySprintsEnabledIfChangedTx(ctx context.Context, tx *sql.Tx, projectID int64, userID int64, enabled bool) error {
+	var fromEnabledInt int
+	if err := tx.QueryRowContext(ctx, `SELECT sprints_enabled FROM projects WHERE id = ?`, projectID).Scan(&fromEnabledInt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("get project sprints_enabled: %w", err)
+	}
+	if (fromEnabledInt == 1) == enabled {
+		return nil
+	}
+	nowMs := time.Now().UTC().UnixMilli()
+	if _, err := tx.ExecContext(ctx, `UPDATE projects SET sprints_enabled = ?, updated_at = ? WHERE id = ?`, boolToInt(enabled), nowMs, projectID); err != nil {
+		return fmt.Errorf("update project sprints enabled: %w", err)
+	}
+	actorUserID := &userID
+	meta := map[string]any{"from_enabled": fromEnabledInt == 1, "to_enabled": enabled}
+	if err := insertAuditEventTx(ctx, tx, projectID, actorUserID, "project_sprints_enabled_updated", "project", &projectID, meta); err != nil {
+		return fmt.Errorf("audit project_sprints_enabled_updated: %w", err)
 	}
 	return nil
 }
@@ -1038,19 +1306,13 @@ func (s *Store) UpdateProjectName(ctx context.Context, projectID int64, userID i
 		return err
 	}
 
-	// Rename bypass auth only if: expires_at IS NOT NULL AND creator_user_id IS NULL (anonymous temp board).
-	// Do not allow unauthenticated rename for any other case.
-	isAnonymousTempBoard := p.ExpiresAt != nil && p.CreatorUserID == nil
-	if isAnonymousTempBoard {
+	if isAnonymousTemporaryBoard(p) {
 		if err := rejectIfExpiredTemporaryProject(p); err != nil {
 			return err
 		}
-		// Anonymous temp boards can be renamed by anyone (no auth required)
-	} else {
-		// Durable or authenticated temp board - require Maintainer+
-		if err := s.CheckProjectRole(ctx, projectID, userID, RoleMaintainer); err != nil {
-			return err
-		}
+		// Anonymous Boards keep slug-based rename without authentication.
+	} else if err := s.checkProjectSettingsAuth(ctx, p, userID); err != nil {
+		return err
 	}
 
 	name = strings.TrimSpace(name)
@@ -1086,7 +1348,14 @@ func (s *Store) UpdateProjectName(ctx context.Context, projectID int64, userID i
 	return nil
 }
 
-// CreateAnonymousBoard creates a new project for anonymous board mode.
+// CreateAnonymousBoard creates a new shareable, expiring board (the /anon entrypoint).
+// The board type depends on whether the request carries an authenticated user, NOT on the
+// deployment mode:
+//   - No authenticated user (always in Anonymous Mode; in Full Mode when signed out) ->
+//     an Anonymous Board (creator_user_id NULL), which is never claimable.
+//   - Authenticated user (Full Mode, signed in) -> a Temporary Board (creator_user_id set),
+//     which only that creator may later claim into a Durable Project.
+//
 // Sets expires_at = now + TemporaryBoardLifetimeDays and last_activity_at = now.
 func (s *Store) CreateAnonymousBoard(ctx context.Context) (Project, error) {
 	nowMs := time.Now().UTC().UnixMilli()
@@ -1098,12 +1367,13 @@ func (s *Store) CreateAnonymousBoard(ctx context.Context) (Project, error) {
 		slug          string
 		creatorUserID *int64
 	)
-	// Check if user is authenticated - set creator_user_id if authenticated
+	// An authenticated request records the creator (Temporary Board); an unauthenticated
+	// request leaves creator_user_id NULL (Anonymous Board).
 	if userID, ok := UserIDFromContext(ctx); ok {
 		creatorUserID = &userID
 	}
 
-	// Set name based on whether board is created in anonymous mode (no creator) or auth state (with creator)
+	// Name reflects the board type: Anonymous Board (no creator) vs Temporary Board (creator set).
 	var name string
 	if creatorUserID == nil {
 		name = "Anonymous Board"
@@ -1134,6 +1404,10 @@ func (s *Store) CreateAnonymousBoard(ctx context.Context) (Project, error) {
 			return Project{}, fmt.Errorf("last insert id anonymous board: %w", err)
 		}
 		id = lastID
+		if err := s.ensureDefaultPriorityTiersTx(ctx, tx, id); err != nil {
+			_ = tx.Rollback()
+			return Project{}, err
+		}
 
 		actorUserID := creatorUserID
 		meta := map[string]any{"name": name, "is_anonymous": creatorUserID == nil}
@@ -1165,6 +1439,7 @@ func (s *Store) CreateAnonymousBoard(ctx context.Context) (Project, error) {
 		DominantColor:      "#888888",
 		EstimationMode:     EstimationModeModifiedFibonacci,
 		DefaultSprintWeeks: 2,
+		SprintsEnabled:     true,
 		Slug:               slug,
 		LastActivityAt:     time.UnixMilli(nowMs).UTC(),
 		ExpiresAt:          &expiresAt,

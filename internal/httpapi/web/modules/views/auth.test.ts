@@ -34,7 +34,7 @@ const enCatalog = {
   "auth.2fa.submit": "Verify",
   "auth.2fa.title": "Two-factor authentication",
   "auth.actions.bootstrap": "Bootstrap",
-  "auth.actions.login": "Login",
+  "auth.actions.login": "Sign in with your Scrumboy password",
   "auth.actions.resetPassword": "Reset Password",
   "auth.bootstrap.failed": "Setup failed.",
   "auth.bootstrap.title": "First-time setup",
@@ -45,6 +45,13 @@ const enCatalog = {
   "auth.fields.newPassword.label": "New password",
   "auth.fields.newPassword.placeholder": "Min 8 characters",
   "auth.fields.password.placeholder": "Password",
+  "auth.forgot.backToSignIn": "Back to sign in",
+  "auth.forgot.failed": "Could not request a password reset.",
+  "auth.forgot.helper": "Enter your email to reset your Scrumboy password. If you sign in with SSO, reset your SSO credentials through your organization’s identity provider.",
+  "auth.forgot.link": "Forgot your Scrumboy password?",
+  "auth.forgot.submit": "Send reset link",
+  "auth.forgot.success": "If an account exists for that email address, a password reset email has been sent.",
+  "auth.forgot.title": "Reset your password",
   "auth.login.failed": "Login failed.",
   "auth.oidc.button": "Continue with SSO",
   "auth.oidc.error.email": "A verified email address is required.",
@@ -78,7 +85,7 @@ const deCatalog = {
   "auth.2fa.submit": "Bestätigen",
   "auth.2fa.title": "Zwei-Faktor-Authentifizierung",
   "auth.actions.bootstrap": "Einrichten",
-  "auth.actions.login": "Anmelden",
+  "auth.actions.login": "Mit deinem Scrumboy-Passwort anmelden",
   "auth.actions.resetPassword": "Passwort zurücksetzen",
   "auth.bootstrap.failed": "Einrichtung fehlgeschlagen.",
   "auth.bootstrap.title": "Ersteinrichtung",
@@ -89,6 +96,13 @@ const deCatalog = {
   "auth.fields.newPassword.label": "Neues Passwort",
   "auth.fields.newPassword.placeholder": "Mindestens 8 Zeichen",
   "auth.fields.password.placeholder": "Passwort",
+  "auth.forgot.backToSignIn": "Zurück zur Anmeldung",
+  "auth.forgot.failed": "Die Anfrage zum Zurücksetzen des Passworts konnte nicht gesendet werden.",
+  "auth.forgot.helper": "Gib deine E-Mail-Adresse ein, um dein Scrumboy-Passwort zurückzusetzen. Wenn du dich per SSO anmeldest, setze deine SSO-Anmeldedaten über den Identitätsanbieter deiner Organisation zurück.",
+  "auth.forgot.link": "Scrumboy-Passwort vergessen?",
+  "auth.forgot.submit": "Link zum Zurücksetzen senden",
+  "auth.forgot.success": "Falls ein Konto mit dieser E-Mail-Adresse existiert, wurde eine E-Mail zum Zurücksetzen des Passworts gesendet.",
+  "auth.forgot.title": "Passwort zurücksetzen",
   "auth.login.failed": "Anmeldung fehlgeschlagen.",
   "auth.oidc.button": "Mit SSO fortfahren",
   "auth.oidc.error.email": "Eine verifizierte E-Mail-Adresse ist erforderlich.",
@@ -122,7 +136,7 @@ const frCatalog = {
   "auth.2fa.submit": "Vérifier",
   "auth.2fa.title": "Authentification à deux facteurs",
   "auth.actions.bootstrap": "Initialiser",
-  "auth.actions.login": "Se connecter",
+  "auth.actions.login": "Se connecter avec le mot de passe Scrumboy",
   "auth.actions.resetPassword": "Réinitialiser le mot de passe",
   "auth.bootstrap.failed": "Échec de la configuration initiale.",
   "auth.bootstrap.title": "Configuration initiale",
@@ -166,7 +180,7 @@ const ptCatalog = {
   "auth.2fa.submit": "Verificar",
   "auth.2fa.title": "Autenticação de dois fatores",
   "auth.actions.bootstrap": "Configurar",
-  "auth.actions.login": "Entrar",
+  "auth.actions.login": "Entrar com a senha do Scrumboy",
   "auth.actions.resetPassword": "Redefinir senha",
   "auth.bootstrap.failed": "Falha na configuração inicial.",
   "auth.bootstrap.title": "Configuração inicial",
@@ -210,7 +224,7 @@ const arCatalog = {
   "auth.2fa.submit": "تحقق",
   "auth.2fa.title": "المصادقة الثنائية",
   "auth.actions.bootstrap": "إعداد أولي",
-  "auth.actions.login": "تسجيل الدخول",
+  "auth.actions.login": "سجّل الدخول بكلمة مرور Scrumboy",
   "auth.actions.resetPassword": "إعادة تعيين كلمة المرور",
   "auth.bootstrap.failed": "فشل الإعداد.",
   "auth.bootstrap.title": "الإعداد لأول مرة",
@@ -254,7 +268,7 @@ const ruCatalog = {
   "auth.2fa.submit": "Проверить",
   "auth.2fa.title": "Двухфакторная аутентификация",
   "auth.actions.bootstrap": "Настройка",
-  "auth.actions.login": "Войти",
+  "auth.actions.login": "Войти с паролем Scrumboy",
   "auth.actions.resetPassword": "Сбросить пароль",
   "auth.bootstrap.failed": "Настройка не удалась.",
   "auth.bootstrap.title": "Первоначальная настройка",
@@ -298,7 +312,7 @@ const jaCatalog = {
   "auth.2fa.submit": "確認",
   "auth.2fa.title": "二要素認証",
   "auth.actions.bootstrap": "初期設定",
-  "auth.actions.login": "ログイン",
+  "auth.actions.login": "Scrumboy パスワードでサインイン",
   "auth.actions.resetPassword": "パスワードをリセット",
   "auth.bootstrap.failed": "セットアップに失敗しました。",
   "auth.bootstrap.title": "初回セットアップ",
@@ -342,7 +356,7 @@ const trCatalog = {
   "auth.2fa.submit": "Doğrula",
   "auth.2fa.title": "İki faktörlü kimlik doğrulama",
   "auth.actions.bootstrap": "Kurulum",
-  "auth.actions.login": "Giriş yap",
+  "auth.actions.login": "Scrumboy parolanızla oturum açın",
   "auth.actions.resetPassword": "Parolayı sıfırla",
   "auth.bootstrap.failed": "Kurulum başarısız.",
   "auth.bootstrap.title": "İlk kurulum",
@@ -386,7 +400,7 @@ const koCatalog = {
   "auth.2fa.submit": "인증",
   "auth.2fa.title": "2단계 인증",
   "auth.actions.bootstrap": "초기 설정",
-  "auth.actions.login": "로그인",
+  "auth.actions.login": "Scrumboy 비밀번호로 로그인",
   "auth.actions.resetPassword": "비밀번호 재설정",
   "auth.bootstrap.failed": "설정에 실패했습니다.",
   "auth.bootstrap.title": "최초 설정",
@@ -430,7 +444,7 @@ const zhCatalog = {
   "auth.2fa.submit": "验证",
   "auth.2fa.title": "双因素认证",
   "auth.actions.bootstrap": "初始化",
-  "auth.actions.login": "登录",
+  "auth.actions.login": "使用 Scrumboy 密码登录",
   "auth.actions.resetPassword": "重置密码",
   "auth.bootstrap.failed": "设置失败。",
   "auth.bootstrap.title": "首次设置",
@@ -474,7 +488,7 @@ const idCatalog = {
   "auth.2fa.submit": "Verifikasi",
   "auth.2fa.title": "Autentikasi dua faktor",
   "auth.actions.bootstrap": "Penyiapan",
-  "auth.actions.login": "Masuk",
+  "auth.actions.login": "Masuk dengan kata sandi Scrumboy Anda",
   "auth.actions.resetPassword": "Atur ulang kata sandi",
   "auth.bootstrap.failed": "Penyiapan gagal.",
   "auth.bootstrap.title": "Penyiapan pertama",
@@ -518,7 +532,7 @@ const viCatalog = {
   "auth.2fa.submit": "Xác minh",
   "auth.2fa.title": "Xác thực hai yếu tố",
   "auth.actions.bootstrap": "Thiết lập",
-  "auth.actions.login": "Đăng nhập",
+  "auth.actions.login": "Đăng nhập bằng mật khẩu Scrumboy của bạn",
   "auth.actions.resetPassword": "Đặt lại mật khẩu",
   "auth.bootstrap.failed": "Thiết lập thất bại.",
   "auth.bootstrap.title": "Thiết lập lần đầu",
@@ -562,7 +576,7 @@ const thCatalog = {
   "auth.2fa.submit": "ยืนยัน",
   "auth.2fa.title": "การยืนยันตัวตนสองขั้นตอน",
   "auth.actions.bootstrap": "เริ่มตั้งค่า",
-  "auth.actions.login": "เข้าสู่ระบบ",
+  "auth.actions.login": "ลงชื่อเข้าใช้ด้วยรหัสผ่าน Scrumboy ของคุณ",
   "auth.actions.resetPassword": "รีเซ็ตรหัสผ่าน",
   "auth.bootstrap.failed": "การตั้งค่าล้มเหลว",
   "auth.bootstrap.title": "การตั้งค่าครั้งแรก",
@@ -606,7 +620,7 @@ const urCatalog = {
   "auth.2fa.submit": "تصدیق کریں",
   "auth.2fa.title": "دو عنصر کی تصدیق",
   "auth.actions.bootstrap": "ابتدائی سیٹ اپ",
-  "auth.actions.login": "لاگ ان",
+  "auth.actions.login": "اپنے Scrumboy پاس ورڈ سے سائن اِن کریں",
   "auth.actions.resetPassword": "پاس ورڈ ری سیٹ",
   "auth.bootstrap.failed": "سیٹ اپ ناکام رہا۔",
   "auth.bootstrap.title": "پہلی بار سیٹ اپ",
@@ -650,7 +664,7 @@ const hiCatalog = {
   "auth.2fa.submit": "सत्यापित करें",
   "auth.2fa.title": "दो-कारक प्रमाणीकरण",
   "auth.actions.bootstrap": "प्रारंभिक सेटअप",
-  "auth.actions.login": "लॉग इन",
+  "auth.actions.login": "अपने Scrumboy पासवर्ड से साइन इन करें",
   "auth.actions.resetPassword": "पासवर्ड रीसेट",
   "auth.bootstrap.failed": "सेटअप विफल रहा।",
   "auth.bootstrap.title": "पहली बार सेटअप",
@@ -694,7 +708,7 @@ const esCatalog = {
   "auth.2fa.submit": "Verificar",
   "auth.2fa.title": "Autenticación de dos factores",
   "auth.actions.bootstrap": "Configuración inicial",
-  "auth.actions.login": "Iniciar sesión",
+  "auth.actions.login": "Iniciar sesión con la contraseña de Scrumboy",
   "auth.actions.resetPassword": "Restablecer contraseña",
   "auth.bootstrap.failed": "La configuración falló.",
   "auth.bootstrap.title": "Configuración inicial",
@@ -738,7 +752,7 @@ const itCatalog = {
   "auth.2fa.submit": "Verifica",
   "auth.2fa.title": "Autenticazione a due fattori",
   "auth.actions.bootstrap": "Configurazione iniziale",
-  "auth.actions.login": "Accedi",
+  "auth.actions.login": "Accedi con la password Scrumboy",
   "auth.actions.resetPassword": "Reimposta password",
   "auth.bootstrap.failed": "Configurazione non riuscita.",
   "auth.bootstrap.title": "Configurazione iniziale",
@@ -782,7 +796,7 @@ const pseudoCatalog = {
   "auth.2fa.submit": "[!! Verify !!]",
   "auth.2fa.title": "[!! Two-factor authentication !!]",
   "auth.actions.bootstrap": "[!! Bootstrap !!]",
-  "auth.actions.login": "[!! Login !!]",
+  "auth.actions.login": "[!! Sign in with your Scrumboy password !!]",
   "auth.actions.resetPassword": "[!! Reset Password !!]",
   "auth.bootstrap.failed": "[!! Setup failed. !!]",
   "auth.bootstrap.title": "[!! First-time setup !!]",
@@ -793,6 +807,13 @@ const pseudoCatalog = {
   "auth.fields.newPassword.label": "[!! New password !!]",
   "auth.fields.newPassword.placeholder": "[!! Min 8 characters !!]",
   "auth.fields.password.placeholder": "[!! Password !!]",
+  "auth.forgot.backToSignIn": "[!! Back to sign in !!]",
+  "auth.forgot.failed": "[!! Could not request a password reset. !!]",
+  "auth.forgot.helper": "[!! Enter your email to reset your Scrumboy password. If you sign in with SSO, reset your SSO credentials through your organization’s identity provider. !!]",
+  "auth.forgot.link": "[!! Forgot your Scrumboy password? !!]",
+  "auth.forgot.submit": "[!! Send reset link !!]",
+  "auth.forgot.success": "[!! If an account exists for that email address, a password reset email has been sent. !!]",
+  "auth.forgot.title": "[!! Reset your password !!]",
   "auth.login.failed": "[!! Login failed. !!]",
   "auth.oidc.button": "[!! Continue with SSO !!]",
   "auth.oidc.error.email": "[!! A verified email address is required. !!]",
@@ -958,8 +979,229 @@ describe("auth view i18n", () => {
     expect(document.querySelector(".auth-divider span")?.textContent).toBe("or");
     expect((document.getElementById("authEmail") as HTMLInputElement | null)?.placeholder).toBe("Email");
     expect((document.getElementById("authPassword") as HTMLInputElement | null)?.placeholder).toBe("Password");
-    expect(document.getElementById("loginBtn")?.textContent).toBe("Login");
+    expect(document.getElementById("loginBtn")?.textContent).toBe("Sign in with your Scrumboy password");
     expect(document.getElementById("authPasswordToggle")?.getAttribute("aria-label")).toBe("Show password");
+  });
+
+  it("shows forgot password only for configured local sign-in outside bootstrap", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+
+    auth.renderAuth({ localAuthEnabled: true, selfServicePasswordResetEnabled: true });
+    expect(document.getElementById("authForgotPassword")?.textContent).toBe("Forgot your Scrumboy password?");
+
+    auth.renderAuth({ bootstrap: true, localAuthEnabled: true, selfServicePasswordResetEnabled: true });
+    expect(document.getElementById("authForgotPassword")).toBeNull();
+
+    auth.renderAuth({ oidcEnabled: true, localAuthEnabled: false, selfServicePasswordResetEnabled: true });
+    expect(document.getElementById("authForgotPassword")).toBeNull();
+    expect(document.getElementById("authForm")).toBeNull();
+
+    auth.renderAuth({ localAuthEnabled: true, selfServicePasswordResetEnabled: false });
+    expect(document.getElementById("authForgotPassword")).toBeNull();
+  });
+
+  it("opens the forgot step with the typed email and returns without losing sign-in state", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+
+    auth.renderAuth({
+      next: "/dashboard?tab=mine",
+      oidcEnabled: true,
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+    const emailEl = document.getElementById("authEmail") as HTMLInputElement;
+    const passwordEl = document.getElementById("authPassword") as HTMLInputElement;
+    emailEl.value = "first@example.com";
+    passwordEl.value = "secret";
+    document.getElementById("authPasswordToggle")?.click();
+    document.getElementById("authForgotPassword")?.click();
+
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Reset your password");
+    const forgotEmailEl = document.getElementById("authForgotEmail") as HTMLInputElement;
+    expect(forgotEmailEl.value).toBe("first@example.com");
+    expect(forgotEmailEl.getAttribute("aria-label")).toBe("Email");
+    expect(document.activeElement).toBe(forgotEmailEl);
+
+    forgotEmailEl.value = "edited@example.com";
+    forgotEmailEl.dispatchEvent(new Event("input", { bubbles: true }));
+    document.getElementById("authForgotBack")?.click();
+
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Sign in");
+    expect((document.getElementById("authEmail") as HTMLInputElement).value).toBe("edited@example.com");
+    expect((document.getElementById("authPassword") as HTMLInputElement).value).toBe("secret");
+    expect((document.getElementById("authPassword") as HTMLInputElement).type).toBe("text");
+    expect(document.getElementById("authSsoBtn")?.getAttribute("href")).toContain(
+      "return_to=%2Fdashboard%3Ftab%3Dmine",
+    );
+    expect(document.getElementById("authForgotPassword")).not.toBeNull();
+  });
+
+  it("requests a reset with generic localized success, then restores sign-in and next", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+    apiFetchMock
+      .mockResolvedValueOnce({ message: "This address belongs to an account." })
+      .mockResolvedValueOnce({});
+
+    auth.renderAuth({
+      next: "/projects?from=forgot",
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "user@example.com";
+    (document.getElementById("authPassword") as HTMLInputElement).value = "password";
+    document.getElementById("authForgotPassword")?.click();
+    document.getElementById("authForgotForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, "/api/auth/request-password-reset", {
+      method: "POST",
+      body: JSON.stringify({ email: "user@example.com" }),
+    });
+    expect(showToastMock).toHaveBeenCalledWith(
+      "If an account exists for that email address, a password reset email has been sent.",
+    );
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Sign in");
+    expect((document.getElementById("authEmail") as HTMLInputElement).value).toBe("user@example.com");
+    expect((document.getElementById("authPassword") as HTMLInputElement).value).toBe("password");
+    expect(redirectAfterAuthMock).not.toHaveBeenCalled();
+
+    document.getElementById("authForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, "/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: "user@example.com", password: "password" }),
+    });
+    expect(redirectAfterAuthMock).toHaveBeenCalledWith("/projects?from=forgot");
+  });
+
+  it("keeps the forgot step open and localizes rate-limit and fallback failures", async () => {
+    await setupI18n("de");
+    const auth = await import("./auth.js");
+    apiFetchMock.mockRejectedValueOnce({ status: 429, message: "HTTP 429" });
+
+    auth.renderAuth({ localAuthEnabled: true, selfServicePasswordResetEnabled: true });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "user@example.com";
+    document.getElementById("authForgotPassword")?.click();
+    document.getElementById("authForgotForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(showToastMock).toHaveBeenLastCalledWith("Zu viele Versuche. Bitte später erneut versuchen.");
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Passwort zurücksetzen");
+    expect((document.getElementById("authForgotSubmit") as HTMLButtonElement).disabled).toBe(false);
+    expect((document.getElementById("authForgotBack") as HTMLButtonElement).disabled).toBe(false);
+
+    apiFetchMock.mockRejectedValueOnce({ status: 500, message: "HTTP 500" });
+    document.getElementById("authForgotForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await flushPromises();
+
+    expect(showToastMock).toHaveBeenLastCalledWith(
+      "Die Anfrage zum Zurücksetzen des Passworts konnte nicht gesendet werden.",
+    );
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Passwort zurücksetzen");
+  });
+
+  it("disables forgot actions in flight and ignores duplicate submissions", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+    let resolveRequest: ((value: unknown) => void) | undefined;
+    apiFetchMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveRequest = resolve;
+    }));
+
+    auth.renderAuth({ localAuthEnabled: true, selfServicePasswordResetEnabled: true });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "user@example.com";
+    document.getElementById("authForgotPassword")?.click();
+    const form = document.getElementById("authForgotForm");
+    form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    form?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect((document.getElementById("authForgotSubmit") as HTMLButtonElement).disabled).toBe(true);
+    expect((document.getElementById("authForgotBack") as HTMLButtonElement).disabled).toBe(true);
+
+    resolveRequest?.({});
+    await flushPromises();
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Sign in");
+  });
+
+  it("ignores stale forgot completions after a newer auth render or navigation", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+    let resolveRequest: ((value: unknown) => void) | undefined;
+    let rejectRequest: ((reason?: unknown) => void) | undefined;
+    apiFetchMock
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveRequest = resolve;
+      }))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectRequest = reject;
+      }));
+
+    auth.renderAuth({
+      next: "/old-success",
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "old@example.com";
+    document.getElementById("authForgotPassword")?.click();
+    document.getElementById("authForgotForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+    auth.renderAuth({
+      next: "/newer-success",
+      oidcEnabled: true,
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: false,
+    });
+    resolveRequest?.({});
+    await flushPromises();
+
+    expect(showToastMock).not.toHaveBeenCalled();
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Sign in");
+    expect((document.getElementById("authEmail") as HTMLInputElement).value).toBe("");
+    expect(document.getElementById("authSsoBtn")?.getAttribute("href")).toContain("return_to=%2Fnewer-success");
+
+    auth.renderAuth({
+      next: "/old-error",
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "old@example.com";
+    document.getElementById("authForgotPassword")?.click();
+    document.getElementById("authForgotForm")?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+
+    document.body.innerHTML = `<div class="page page--projects"><h1>Newer page</h1></div>`;
+    rejectRequest?.(new Error("network failed"));
+    await flushPromises();
+
+    expect(showToastMock).not.toHaveBeenCalled();
+    expect(document.querySelector("h1")?.textContent).toBe("Newer page");
+  });
+
+  it("relocalizes an open forgot step without clearing the edited email", async () => {
+    const i18n = await setupI18n("en");
+    const auth = await import("./auth.js");
+
+    auth.renderAuth({ localAuthEnabled: true, selfServicePasswordResetEnabled: true });
+    (document.getElementById("authEmail") as HTMLInputElement).value = "first@example.com";
+    document.getElementById("authForgotPassword")?.click();
+    const forgotEmailEl = document.getElementById("authForgotEmail") as HTMLInputElement;
+    forgotEmailEl.value = "edited@example.com";
+    forgotEmailEl.dispatchEvent(new Event("input", { bubbles: true }));
+
+    await i18n.setLocale("de");
+    await flushPromises();
+
+    expect(document.querySelector(".panel__title")?.textContent).toBe("Passwort zurücksetzen");
+    expect(document.querySelector(".muted")?.textContent).toContain("Scrumboy-Passwort");
+    expect(document.querySelector(".muted")?.textContent).toContain("SSO");
+    expect(document.getElementById("authForgotSubmit")?.textContent).toBe("Link zum Zurücksetzen senden");
+    expect(document.getElementById("authForgotBack")?.textContent).toBe("Zurück zur Anmeldung");
+    expect((document.getElementById("authForgotEmail") as HTMLInputElement).value).toBe("edited@example.com");
+    expect((document.getElementById("authForgotEmail") as HTMLInputElement).getAttribute("aria-label")).toBe("E-Mail");
   });
 
   it("renders a public language selector in every auth shell", async () => {
@@ -1019,6 +1261,25 @@ describe("auth view i18n", () => {
     expect(authLocaleOptionValues()).not.toContain("pseudo");
   });
 
+  it("pins the open auth locale list with fixed positioning", async () => {
+    await setupI18n("en");
+    const auth = await import("./auth.js");
+
+    auth.renderAuth({ next: "/dashboard", oidcEnabled: true, localAuthEnabled: true });
+
+    const button = getAuthLocaleSelect();
+    button.click();
+
+    const list = button.closest(".locale-picker")?.querySelector(".locale-picker__list") as HTMLUListElement;
+    expect(list.hidden).toBe(false);
+    expect(list.style.position).toBe("fixed");
+    expect(list.style.top).toMatch(/px$/);
+    expect(list.style.left || list.style.right).toMatch(/px$/);
+    expect(list.style.minWidth).toMatch(/px$/);
+    expect(list.style.zIndex).toBe("1000");
+    expect(list.querySelectorAll('[role="option"]').length).toBe(EXPECTED_PUBLIC_LOCALES.length);
+  });
+
   it("selecting Arabic in the auth selector sets RTL document direction", async () => {
     const i18n = await setupI18n("en");
     const auth = await import("./auth.js");
@@ -1048,6 +1309,7 @@ describe("auth view i18n", () => {
 
     expect(i18n.getLocale()).toBe("de");
     expect(localStorage.getItem(i18n.LOCALE_STORAGE_KEY)).toBe("de");
+    expect(document.cookie).toContain(`${i18n.LOCALE_STORAGE_KEY}=de`);
     expect(getAuthLocalePickerSelectedLocale()).toBe("de");
     expect(getAuthLocaleSelect().getAttribute("aria-label")).toBe("Sprache");
     expect(document.querySelector(".panel__title")?.textContent).toBe("Anmelden");
@@ -1473,7 +1735,14 @@ describe("auth view i18n", () => {
     });
 
     auth.renderAuth({ next: "/dashboard", oidcEnabled: true, localAuthEnabled: true });
-    auth.renderAuth({ next: "/projects", oidcEnabled: true, localAuthEnabled: true });
+    auth.renderAuth({
+      next: "/projects",
+      oidcEnabled: true,
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+    document.getElementById("authForgotPassword")?.click();
+    document.getElementById("authForgotBack")?.click();
 
     (document.getElementById("authEmail") as HTMLInputElement).value = "user@example.com";
     (document.getElementById("authPassword") as HTMLInputElement).value = "password";

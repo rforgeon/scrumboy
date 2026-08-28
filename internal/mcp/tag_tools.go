@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	tagapp "scrumboy/internal/application/tag"
 	"scrumboy/internal/store"
 )
 
@@ -14,21 +15,73 @@ type updateMineTagColorInput struct {
 	Color *string `json:"color"`
 }
 
-// deleteMineTagInput is the input for tags.deleteMine (tagId only; mine-scope / user library).
+// deleteMineTagInput is the input for tags_deleteMine (tagId only; mine-scope / user library).
 type deleteMineTagInput struct {
 	TagID int64 `json:"tagId"`
 }
 
+// updateProjectTagColorInput is the input for tags_updateProjectColor. TagID and
+// TagName are pointers so a supplied-but-invalid value (0, negative, empty string) is
+// distinguishable from an absent one and cannot be silently ignored when the other
+// field is also present.
 type updateProjectTagColorInput struct {
 	ProjectSlug string  `json:"projectSlug"`
-	TagID       int64   `json:"tagId"`
+	TagID       *int64  `json:"tagId"`
+	TagName     *string `json:"tagName"`
 	Color       *string `json:"color"`
 }
 
-// deleteProjectTagInput is the input for tags.deleteProject (projectSlug + tagId; project-scoped rows only).
+// deleteProjectTagInput is the input for tags_deleteProject (projectSlug + tagId; project-scoped rows only).
 type deleteProjectTagInput struct {
 	ProjectSlug string `json:"projectSlug"`
 	TagID       int64  `json:"tagId"`
+}
+
+func mapTagColorPrepareError(err error) *adapterError {
+	switch {
+	case errors.Is(err, tagapp.ErrActorRequired):
+		return newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
+	case errors.Is(err, tagapp.ErrMaintainerRequired):
+		return newAdapterError(http.StatusForbidden, CodeForbidden, "maintainer or higher required", nil)
+	default:
+		return mapStoreError(err)
+	}
+}
+
+func mapTagColorUpdateError(err error) *adapterError {
+	if errors.Is(err, tagapp.ErrColorProjectionMissing) {
+		return newAdapterError(
+			http.StatusInternalServerError,
+			CodeInternal,
+			"internal error",
+			map[string]any{"detail": "updated project tag not found in post-read"},
+		)
+	}
+	return mapStoreError(err)
+}
+
+func mapTagDeletionPrepareError(err error) *adapterError {
+	switch {
+	case errors.Is(err, tagapp.ErrActorRequired):
+		return newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
+	case errors.Is(err, tagapp.ErrMaintainerRequired):
+		return newAdapterError(http.StatusForbidden, CodeForbidden, "maintainer or higher required", nil)
+	default:
+		return mapStoreError(err)
+	}
+}
+
+func mapTagDeletionExecuteError(err error) *adapterError {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return newAdapterError(http.StatusNotFound, CodeNotFound, "not found", nil)
+	case errors.Is(err, store.ErrUnauthorized):
+		return newAdapterError(http.StatusForbidden, CodeForbidden, err.Error(), nil)
+	case errors.Is(err, store.ErrConflict):
+		return newAdapterError(http.StatusConflict, CodeConflict, err.Error(), nil)
+	default:
+		return mapStoreError(err)
+	}
 }
 
 func (a *Adapter) handleTagsListProject(ctx context.Context, input any) (any, map[string]any, *adapterError) {
@@ -39,9 +92,9 @@ func (a *Adapter) handleTagsListProject(ctx context.Context, input any) (any, ma
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.listProject is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_listProject is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.listProject is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_listProject is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -66,18 +119,26 @@ func (a *Adapter) handleTagsListProject(ctx context.Context, input any) (any, ma
 
 	items := make([]projectTagItem, 0, len(tags))
 	for _, tag := range tags {
-		items = append(items, projectTagItem{
-			TagID:     tag.TagID,
-			Name:      tag.Name,
-			Count:     tag.Count,
-			Color:     tag.Color,
-			CanDelete: tag.CanDelete,
-		})
+		items = append(items, toProjectTagItem(tag))
 	}
 
 	return map[string]any{
 		"items": items,
 	}, map[string]any{}, nil
+}
+
+// toProjectTagItem projects a grouped store.TagCount into the MCP wire item.
+func toProjectTagItem(tc store.TagCount) projectTagItem {
+	return projectTagItem{
+		TagID:            tc.TagID,
+		Name:             tc.Name,
+		Count:            tc.Count,
+		Color:            tc.Color,
+		DeleteScope:      tc.DeleteScope(),
+		CanDeleteMine:    tc.CanDeleteMine,
+		CanDeleteProject: tc.CanDeleteProject,
+		CanUpdateColor:   tc.CanUpdateColor,
+	}
 }
 
 func (a *Adapter) handleTagsListMine(ctx context.Context, input any) (any, map[string]any, *adapterError) {
@@ -88,9 +149,9 @@ func (a *Adapter) handleTagsListMine(ctx context.Context, input any) (any, map[s
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.listMine is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_listMine is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.listMine is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_listMine is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -128,9 +189,9 @@ func (a *Adapter) handleTagsUpdateMineColor(ctx context.Context, input any) (any
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.updateMineColor is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_updateMineColor is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.updateMineColor is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_updateMineColor is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -146,30 +207,18 @@ func (a *Adapter) handleTagsUpdateMineColor(ctx context.Context, input any) (any
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "color cannot be empty; use null to clear", map[string]any{"field": "color"})
 	}
 
-	userID, ok := store.UserIDFromContext(ctx)
-	if !ok {
-		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
+	prepared, prepareErr := a.tagColors.PrepareMineID(ctx, tagapp.MCPMineIDColorTarget{
+		TagID: in.TagID,
+		Color: tagapp.NewColorIntent(in.Color),
+	})
+	if prepareErr != nil {
+		return nil, nil, mapTagColorPrepareError(prepareErr)
 	}
-
-	tags, tagsErr := a.store.ListUserTags(ctx, userID)
-	if tagsErr != nil {
-		return nil, nil, mapStoreError(tagsErr)
-	}
-	tag, found := findMineTag(tags, in.TagID)
-	if !found {
-		return nil, nil, newAdapterError(http.StatusNotFound, CodeNotFound, "not found", nil)
-	}
-
-	updateErr := a.store.UpdateTagColor(ctx, &userID, in.TagID, in.Color)
+	tag, updateErr := prepared.Update()
 	if updateErr != nil {
-		// Clearing a color preference when none exists is a harmless no-op for this
-		// mine-scope MCP tool; normalize the store quirk into a successful clear.
-		if !(isColorClear(in.Color) && errors.Is(updateErr, store.ErrNotFound)) {
-			return nil, nil, mapStoreError(updateErr)
-		}
+		return nil, nil, mapTagColorUpdateError(updateErr)
 	}
 
-	tag.Color = normalizedMineColor(in.Color)
 	return map[string]any{
 		"tag": mineTagItem{
 			TagID:     tag.TagID,
@@ -188,9 +237,9 @@ func (a *Adapter) handleTagsDeleteMine(ctx context.Context, input any) (any, map
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.deleteMine is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_deleteMine is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.deleteMine is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_deleteMine is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -203,30 +252,14 @@ func (a *Adapter) handleTagsDeleteMine(ctx context.Context, input any) (any, map
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "invalid tagId", map[string]any{"field": "tagId"})
 	}
 
-	userID, ok := store.UserIDFromContext(ctx)
-	if !ok {
-		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
+	prepared, prepareErr := a.tagDeletions.PrepareMineID(ctx, tagapp.MCPMineIDDeletionTarget{
+		TagID: in.TagID,
+	})
+	if prepareErr != nil {
+		return nil, nil, mapTagDeletionPrepareError(prepareErr)
 	}
-
-	tags, tagsErr := a.store.ListUserTags(ctx, userID)
-	if tagsErr != nil {
-		return nil, nil, mapStoreError(tagsErr)
-	}
-	if _, found := findMineTag(tags, in.TagID); !found {
-		return nil, nil, newAdapterError(http.StatusNotFound, CodeNotFound, "not found", nil)
-	}
-
-	if err := a.store.DeleteTag(ctx, userID, in.TagID, false); err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			return nil, nil, newAdapterError(http.StatusNotFound, CodeNotFound, "not found", nil)
-		case errors.Is(err, store.ErrUnauthorized):
-			return nil, nil, newAdapterError(http.StatusForbidden, CodeForbidden, err.Error(), nil)
-		case errors.Is(err, store.ErrConflict):
-			return nil, nil, newAdapterError(http.StatusConflict, CodeConflict, err.Error(), nil)
-		default:
-			return nil, nil, mapStoreError(err)
-		}
+	if deleteErr := prepared.Delete(); deleteErr != nil {
+		return nil, nil, mapTagDeletionExecuteError(deleteErr)
 	}
 
 	return map[string]any{
@@ -244,9 +277,9 @@ func (a *Adapter) handleTagsUpdateProjectColor(ctx context.Context, input any) (
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.updateProjectColor is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_updateProjectColor is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.updateProjectColor is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_updateProjectColor is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -258,56 +291,56 @@ func (a *Adapter) handleTagsUpdateProjectColor(ctx context.Context, input any) (
 	if in.ProjectSlug == "" {
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "missing projectSlug", map[string]any{"field": "projectSlug"})
 	}
-	if in.TagID <= 0 {
+	// Exactly-one is decided on what the caller *supplied*, not on what happens to be
+	// valid: sending both a malformed tagId and a tagName must fail loudly rather than
+	// quietly falling through to the personal-color path. Presence is therefore taken
+	// from the pointer, and the value is validated only afterwards.
+	suppliedID := in.TagID != nil
+	suppliedName := in.TagName != nil
+	if suppliedID == suppliedName {
+		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "provide exactly one of tagId or tagName", map[string]any{"field": "tagId"})
+	}
+	if suppliedID && *in.TagID <= 0 {
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "invalid tagId", map[string]any{"field": "tagId"})
+	}
+	if suppliedName && strings.TrimSpace(*in.TagName) == "" {
+		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "invalid tagName", map[string]any{"field": "tagName"})
 	}
 	if in.Color != nil && strings.TrimSpace(*in.Color) == "" {
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "color cannot be empty; use null to clear", map[string]any{"field": "color"})
 	}
 
-	pc, pcErr := a.store.GetProjectContextBySlug(ctx, in.ProjectSlug, a.storeMode())
-	if pcErr != nil {
-		return nil, nil, mapStoreError(pcErr)
-	}
-	userID, ok := store.UserIDFromContext(ctx)
-	if !ok {
-		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
-	}
-	if !pc.Role.HasMinimumRole(store.RoleMaintainer) {
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeForbidden, "maintainer or higher required", nil)
-	}
-
-	if _, tagErr := a.store.GetProjectScopedTagByID(ctx, pc.Project.ID, in.TagID); tagErr != nil {
-		return nil, nil, mapStoreError(tagErr)
-	}
-
-	// UpdateTagColor mutates tags.color for project-scoped rows; viewerUserID is only used for user-owned tags.
-	updateErr := a.store.UpdateTagColor(ctx, &userID, in.TagID, in.Color)
-	if updateErr != nil {
-		return nil, nil, mapStoreError(updateErr)
-	}
-
-	projectTags, listErr := a.store.ListTagCounts(ctx, &pc)
-	if listErr != nil {
-		return nil, nil, mapStoreError(listErr)
-	}
-	for _, tc := range projectTags {
-		if tc.TagID == in.TagID {
-			return map[string]any{
-				"tag": projectTagItem{
-					TagID:     tc.TagID,
-					Name:      tc.Name,
-					Count:     tc.Count,
-					Color:     tc.Color,
-					CanDelete: tc.CanDelete,
-				},
-			}, map[string]any{}, nil
+	if suppliedName {
+		prepared, prepareErr := a.tagColors.PrepareProjectName(ctx, tagapp.MCPProjectNameColorTarget{
+			ProjectSlug: in.ProjectSlug,
+			Mode:        a.storeMode(),
+			Name:        *in.TagName,
+			Color:       tagapp.NewColorIntent(in.Color),
+		})
+		if prepareErr != nil {
+			return nil, nil, mapTagColorPrepareError(prepareErr)
 		}
+		tag, updateErr := prepared.Update()
+		if updateErr != nil {
+			return nil, nil, mapTagColorUpdateError(updateErr)
+		}
+		return map[string]any{"tag": toProjectTagItem(tag)}, map[string]any{}, nil
 	}
 
-	// Tag existence in project scope was already verified above; if it disappears
-	// here, treat it as an internal inconsistency rather than weakening the contract.
-	return nil, nil, newAdapterError(http.StatusInternalServerError, CodeInternal, "internal error", map[string]any{"detail": "updated project tag not found in post-read"})
+	prepared, prepareErr := a.tagColors.PrepareProjectID(ctx, tagapp.MCPProjectIDColorTarget{
+		ProjectSlug: in.ProjectSlug,
+		Mode:        a.storeMode(),
+		TagID:       *in.TagID,
+		Color:       tagapp.NewColorIntent(in.Color),
+	})
+	if prepareErr != nil {
+		return nil, nil, mapTagColorPrepareError(prepareErr)
+	}
+	tag, updateErr := prepared.Update()
+	if updateErr != nil {
+		return nil, nil, mapTagColorUpdateError(updateErr)
+	}
+	return map[string]any{"tag": toProjectTagItem(tag)}, map[string]any{}, nil
 }
 
 func (a *Adapter) handleTagsDeleteProject(ctx context.Context, input any) (any, map[string]any, *adapterError) {
@@ -318,9 +351,9 @@ func (a *Adapter) handleTagsDeleteProject(ctx context.Context, input any) (any, 
 
 	switch {
 	case a.mode == "anonymous":
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.deleteProject is unavailable in anonymous mode", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_deleteProject is unavailable in anonymous mode", nil)
 	case bootstrapAvailable:
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags.deleteProject is unavailable before bootstrap", nil)
+		return nil, nil, newAdapterError(http.StatusForbidden, CodeCapabilityUnavailable, "tags_deleteProject is unavailable before bootstrap", nil)
 	case !auth.Authenticated:
 		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
 	}
@@ -336,36 +369,19 @@ func (a *Adapter) handleTagsDeleteProject(ctx context.Context, input any) (any, 
 		return nil, nil, newAdapterError(http.StatusBadRequest, CodeValidationError, "invalid tagId", map[string]any{"field": "tagId"})
 	}
 
-	pc, pcErr := a.store.GetProjectContextBySlug(ctx, in.ProjectSlug, a.storeMode())
-	if pcErr != nil {
-		return nil, nil, mapStoreError(pcErr)
+	// MCP project deletion deliberately remains board-scoped-only. The prepared
+	// service verifies the project-scoped row before performing the destructive
+	// operation, so personal rows continue to return not found.
+	prepared, prepareErr := a.tagDeletions.PrepareProjectID(ctx, tagapp.MCPProjectIDDeletionTarget{
+		ProjectSlug: in.ProjectSlug,
+		Mode:        a.storeMode(),
+		TagID:       in.TagID,
+	})
+	if prepareErr != nil {
+		return nil, nil, mapTagDeletionPrepareError(prepareErr)
 	}
-	userID, ok := store.UserIDFromContext(ctx)
-	if !ok {
-		return nil, nil, newAdapterError(http.StatusUnauthorized, CodeAuthRequired, "Sign-in required for this tool", nil)
-	}
-	if !pc.Role.HasMinimumRole(store.RoleMaintainer) {
-		return nil, nil, newAdapterError(http.StatusForbidden, CodeForbidden, "maintainer or higher required", nil)
-	}
-
-	if _, tagErr := a.store.GetProjectScopedTagByID(ctx, pc.Project.ID, in.TagID); tagErr != nil {
-		return nil, nil, mapStoreError(tagErr)
-	}
-
-	p := pc.Project
-	isAnonymousBoard := p.ExpiresAt != nil && p.CreatorUserID == nil
-
-	if err := a.store.DeleteTag(ctx, userID, in.TagID, isAnonymousBoard); err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			return nil, nil, newAdapterError(http.StatusNotFound, CodeNotFound, "not found", nil)
-		case errors.Is(err, store.ErrUnauthorized):
-			return nil, nil, newAdapterError(http.StatusForbidden, CodeForbidden, err.Error(), nil)
-		case errors.Is(err, store.ErrConflict):
-			return nil, nil, newAdapterError(http.StatusConflict, CodeConflict, err.Error(), nil)
-		default:
-			return nil, nil, mapStoreError(err)
-		}
+	if deleteErr := prepared.Delete(); deleteErr != nil {
+		return nil, nil, mapTagDeletionExecuteError(deleteErr)
 	}
 
 	return map[string]any{
@@ -374,24 +390,4 @@ func (a *Adapter) handleTagsDeleteProject(ctx context.Context, input any) (any, 
 			"tagId":       in.TagID,
 		},
 	}, map[string]any{}, nil
-}
-
-func findMineTag(tags []store.TagWithColor, tagID int64) (store.TagWithColor, bool) {
-	for _, tag := range tags {
-		if tag.TagID == tagID {
-			return tag, true
-		}
-	}
-	return store.TagWithColor{}, false
-}
-
-func isColorClear(color *string) bool {
-	return color == nil
-}
-
-func normalizedMineColor(color *string) *string {
-	if isColorClear(color) {
-		return nil
-	}
-	return color
 }

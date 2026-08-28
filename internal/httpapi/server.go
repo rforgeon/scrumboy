@@ -11,12 +11,37 @@ import (
 	"strings"
 	"time"
 
+	boardapp "scrumboy/internal/application/board"
+	calendarapp "scrumboy/internal/application/calendar"
+	membershipapp "scrumboy/internal/application/membership"
+	priorityapp "scrumboy/internal/application/priority"
+	projectapp "scrumboy/internal/application/project"
+	projectsettingsapp "scrumboy/internal/application/projectsettings"
+	"scrumboy/internal/application/refresh"
+	sprintapp "scrumboy/internal/application/sprint"
+	tagapp "scrumboy/internal/application/tag"
+	todoapp "scrumboy/internal/application/todo"
+	todolinkapp "scrumboy/internal/application/todolink"
+	useradminapp "scrumboy/internal/application/useradmin"
+	wallapp "scrumboy/internal/application/wall"
+	workflowapp "scrumboy/internal/application/workflow"
+	"scrumboy/internal/config"
 	"scrumboy/internal/eventbus"
 	"scrumboy/internal/httpapi/ratelimit"
+	"scrumboy/internal/mailer"
 	"scrumboy/internal/oidc"
+	"scrumboy/internal/publicorigin"
 	"scrumboy/internal/store"
 	"scrumboy/internal/version"
 )
+
+// MCPHandler is the MCP HTTP surface plus its startup-only creator-request
+// dependency hook. NewServer binds the hook before returning, so production
+// serving cannot begin with an incompletely configured MCP adapter.
+type MCPHandler interface {
+	http.Handler
+	BindCreatorNotificationRequestPublisher(todoapp.CreatorNotificationRequestPublisher)
+}
 
 type Options struct {
 	Logger              *log.Logger
@@ -25,10 +50,12 @@ type Options struct {
 	ScrumboyMode        string // "full" or "anonymous"
 	// DataDir is the instance data directory (SQLite lives here; also used for per-user wallpaper files).
 	// Empty disables wallpaper upload/serve (returns 503 for those routes).
-	DataDir       string
-	AuthRateLimit *ratelimit.Limiter
-	MCPHandler    http.Handler
-	AgoraHandler  http.Handler
+	DataDir             string
+	AuthRateLimit       *ratelimit.Limiter
+	OAuthDCRRateLimit   *ratelimit.Limiter
+	OAuthTokenRateLimit *ratelimit.Limiter
+	MCPHandler          MCPHandler
+	AgoraHandler        http.Handler
 	// EncryptionKey is the HMAC secret for password reset tokens. Required for admin password reset.
 	// Set from SCRUMBOY_ENCRYPTION_KEY (base64). If unset, password reset endpoints return 503.
 	EncryptionKey []byte
@@ -38,7 +65,7 @@ type Options struct {
 	// Web Push (optional). Push is enabled only in full mode with both public/private VAPID keys set.
 	VAPIDPublicKey  string
 	VAPIDPrivateKey string
-	VAPIDSubscriber string // VAPID JWT "sub" (e.g. mailto:ops@example.com); default in notifier if empty
+	VAPIDSubscriber string // VAPID JWT "sub" (e.g. mailto:ops@example.com); defaults during configuration preparation
 	PushDebug       bool   // Log push send/skip (also SCRUMBOY_DEBUG_PUSH in config)
 
 	// WallEnabled gates the Scrumbaby feature. When false, all /wall routes
@@ -53,27 +80,126 @@ type Options struct {
 	// MermaidNotesEnabled gates Mermaid rendering within the markdown preview.
 	// Effective only when MarkdownNotesEnabled is also true.
 	MermaidNotesEnabled bool
+
+	// SMTP (optional). Enables self-service "forgot password" email via
+	// POST /api/auth/request-password-reset. Enabled when Host is set, Port
+	// is in 1–65535 (defaults to 587 when omitted), and From is a parseable
+	// RFC 5322 address (see SMTPConfigured). Also requires
+	// SCRUMBOY_PUBLIC_BASE_URL for emailed links.
+	SMTPHost     string
+	SMTPPort     int
+	SMTPUsername string
+	SMTPPassword string
+	SMTPFrom     string
+	SMTPTLSMode  string
+	// SMTPDebug, if true, logs each send attempt's connection details (host,
+	// port, TLS mode, whether auth is used) — never credentials or message
+	// bodies. See SCRUMBOY_SMTP_DEBUG in docs/smtp.md.
+	SMTPDebug bool
+
+	// PublicBaseURL (SCRUMBOY_PUBLIC_BASE_URL). Required for self-service
+	// password-reset emails; missing or invalid values fail closed. When set,
+	// overrides the request-derived origin for reset links (see resetBaseURL)
+	// and is the canonical OAuth discovery issuer.
+	PublicBaseURL string
+	PublicOrigin  *publicorigin.Resolver
+
+	// TrustProxy (SCRUMBOY_TRUST_PROXY). When true, clientIP honors
+	// X-Forwarded-For for authentication and OAuth rate-limit IP keys. Default
+	// false (RemoteAddr only). Enable only behind a reverse proxy that
+	// overwrites or strips client-supplied XFF. Without PublicBaseURL, OAuth
+	// discovery also requires forwarded HTTPS and an explicit X-Forwarded-Host.
+	TrustProxy bool
+
+	// CalendarFeedFetcher overrides ICS feed HTTP fetches. Tests inject fakes
+	// so board GET and refresh can assert zero or controlled network use.
+	CalendarFeedFetcher calendarapp.FeedFetcher
+
+	// AllowLoopbackCalendarFeeds permits configuring and fetching ICS URLs on
+	// loopback hosts. Production must leave this false so URL acceptance matches
+	// the default fetcher SSRF policy.
+	AllowLoopbackCalendarFeeds bool
 }
 
 type Server struct {
-	store storeAPI
+	store                         storeAPI
+	boardReads                    *boardapp.ReadService
+	projectCreations              *projectapp.RESTDurableCreationService
+	anonymousBoardCreations       *projectapp.AnonymousBoardCreationService
+	projectUpdates                *projectapp.RESTUpdateService
+	projectDeletions              *projectapp.RESTDeletionService
+	projectClaims                 *projectapp.RESTClaimService
+	todoCreates                   *todoapp.CreateService
+	todoDeletes                   *todoapp.DeleteService
+	todoMoves                     *todoapp.MoveService
+	todoUpdates                   *todoapp.UpdateService
+	todoLegacyDeletes             *todoapp.LegacyDeleteService
+	todoLegacyMoves               *todoapp.LegacyMoveService
+	todoLegacyUpdates             *todoapp.LegacyUpdateService
+	creatorNotificationAuthorizer *todoapp.CreatorNotificationAuthorizationService
+	todoLinkMutations             *todolinkapp.RESTMutationService
+	sprintDefinitions             *sprintapp.RESTDefinitionService
+	sprintLifecycle               *sprintapp.RESTLifecycleService
+	sprintDeletions               *sprintapp.RESTDeletionService
+	workflowMutations             *workflowapp.RESTMutationService
+	priorityMutations             *priorityapp.RESTMutationService
+	calendarSources               *calendarapp.RESTService
+	boardSettings                 *projectsettingsapp.RESTService
+	agenda                        *calendarapp.AgendaService
+	membershipMutations           *membershipapp.RESTMutationService
+	tagColors                     *tagapp.RESTColorService
+	tagDeletions                  *tagapp.RESTDeletionService
+	userCreations                 *useradminapp.RESTCreationService
+	userRoleMutations             *useradminapp.RESTRoleService
+	userDeletions                 *useradminapp.RESTDeletionService
+	wallNoteMutations             *wallapp.RESTNoteService
+	wallReplacements              *wallapp.RESTReplacementService
+	wallEdgeMutations             *wallapp.RESTEdgeService
+	wallTransientMutations        *wallapp.RESTTransientService
 
-	logger              *log.Logger
-	maxBody             int64
-	maxTrelloImportBody int64
-	mode                string // "full" or "anonymous"
-	hub                 *Hub
-	sink                EventSink
-	fanout              *eventbus.Fanout
-	webhookQueue        *webhookQueue
-	webhookCancel       context.CancelFunc
+	logger                  *log.Logger
+	maxBody                 int64
+	maxTrelloImportBody     int64
+	mode                    string // "full" or "anonymous"
+	hub                     *Hub
+	sink                    EventSink
+	fanout                  *eventbus.Fanout
+	webhookQueue            *webhookQueue
+	webhookWorker           *webhookWorker
+	webhookCancel           context.CancelFunc
+	webhookDone             <-chan struct{} // closed once the webhook worker's shutdown flush completes
+	transactionalMailQueue  *mailQueue
+	transactionalMailWorker *mailWorker
+	transactionalMailCancel context.CancelFunc
+	transactionalMailDone   <-chan struct{}
+	notificationMailQueue   *mailQueue
+	notificationMailWorker  *mailWorker
+	notificationMailCancel  context.CancelFunc
+	notificationMailDone    <-chan struct{}
+	emailNotifier           *emailNotifier
 
-	authRateLimit *ratelimit.Limiter
+	authRateLimit       *ratelimit.Limiter
+	oauthDCRRateLimit   *ratelimit.Limiter
+	oauthTokenRateLimit *ratelimit.Limiter
 
 	encryptionKey []byte        // for password reset tokens; nil if not configured
 	oidcService   *oidc.Service // nil when OIDC is not configured
 
-	passwordResetAdminLimiter *ratelimit.Limiter // 10 resets/min per admin
+	passwordResetAdminLimiter   *ratelimit.Limiter // 10 resets/min per admin
+	passwordResetRequestLimiter *ratelimit.Limiter // 5/min per IP+email, self-service request
+	firstPasswordStartLimiter   *ratelimit.Limiter
+	firstPasswordFinishLimiter  *ratelimit.Limiter
+	oidcLinkStartLimiter        *ratelimit.Limiter
+	currentPasswordLimiter      *ratelimit.Limiter
+	secondFactorLimiter         *ratelimit.Limiter
+	totpLimiter                 *ratelimit.Limiter
+	recoveryCodeLimiter         *ratelimit.Limiter
+
+	smtpConfigured bool // Host+port+From statically valid; gates request-password-reset email sending
+
+	publicBaseURL string // SCRUMBOY_PUBLIC_BASE_URL; reset-link origin and canonical OAuth issuer when set
+	trustProxy    bool   // SCRUMBOY_TRUST_PROXY; gates forwarded client IP and OAuth origin signals
+	publicOrigin  *publicorigin.Resolver
 
 	webFS               fs.FS
 	fileSrv             http.Handler
@@ -86,6 +212,7 @@ type Server struct {
 
 	vapidPublicKey      string
 	pushVapidConfigured bool // full mode + both VAPID keys present; subscribe and push notify use this
+	pushStatus          pushStatus
 	pushDebug           bool
 
 	dataDir string // user-wallpapers storage; empty = disabled
@@ -103,12 +230,13 @@ type storeAPI interface {
 	GetUserPasswordHash(ctx context.Context, userID int64) (string, error)
 	UpdateUserImage(ctx context.Context, userID int64, image *string) error
 	UpdateUserPassword(ctx context.Context, userID int64, newPassword string) error
+	ResetLocalPassword(ctx context.Context, userID int64, expectedHash, password string) error
 	BootstrapUser(ctx context.Context, email, password, name string) (store.User, error)
 	AuthenticateUser(ctx context.Context, email, password string) (store.User, error)
-	CreateUser(ctx context.Context, email, password, name string) (store.User, error)
+	useradminapp.UserCreationStore
 	ListUsers(ctx context.Context, requesterID int64) ([]store.User, error)
-	UpdateUserRole(ctx context.Context, requesterID, targetUserID int64, newRole store.SystemRole) error
-	DeleteUser(ctx context.Context, requesterID, targetUserID int64) error
+	useradminapp.UserRoleMutationStore
+	useradminapp.UserDeletionStore
 	AssignUnownedDurableProjectsToUser(ctx context.Context, userID int64) error
 	ClaimTemporaryBoard(ctx context.Context, projectID, userID int64) error
 	CreateSession(ctx context.Context, userID int64, ttl time.Duration) (token string, expiresAt time.Time, err error)
@@ -119,38 +247,55 @@ type storeAPI interface {
 	ListUserAPITokens(ctx context.Context, userID int64) ([]store.APITokenMeta, error)
 	RevokeUserAPIToken(ctx context.Context, userID, tokenID int64) error
 
+	// OAuth 2.1 authorization server (RFC 7591/6749/7636/7009) for MCP clients.
+	CreateOAuthClient(ctx context.Context, clientID, clientName, redirectURI string) (store.OAuthClient, error)
+	GetOAuthClient(ctx context.Context, clientID string) (store.OAuthClient, error)
+	CreateOAuthAuthCode(ctx context.Context, clientID string, userID int64, redirectURI, codeChallenge, codeChallengeMethod, resource string) (string, error)
+	RedeemOAuthAuthCodeAndIssue(ctx context.Context, rawCode, expectedClientID, expectedRedirectURI, expectedResource, codeVerifier string) (store.OAuthTokenPair, error)
+	ConsumeOAuthRefreshTokenAndIssue(ctx context.Context, rawToken, expectedClientID, expectedResource string) (store.OAuthTokenPair, error)
+	RevokeOAuthToken(ctx context.Context, rawToken, hint string) error
+
 	GetUserByOIDCIdentity(ctx context.Context, issuer, subject string) (store.User, error)
+	UpdateOIDCIdentityEmailAtLogin(ctx context.Context, userID int64, issuer, subject, email string) error
 	GetUserByEmail(ctx context.Context, email string) (store.User, error)
 	LinkOIDCIdentity(ctx context.Context, userID int64, issuer, subject, email string) error
+	LinkOIDCIdentityExplicit(ctx context.Context, userID int64, issuer, subject, verifiedEmail string) error
 	CreateUserOIDC(ctx context.Context, configuredIssuer, issuer, subject, email, name string) (store.User, error)
+	CreateFirstPasswordGrant(ctx context.Context, userID int64, sessionToken string, ttl time.Duration) (string, time.Time, error)
+	FirstPasswordGrantValid(ctx context.Context, rawGrant, sessionToken string, userID int64) (bool, error)
+	SetFirstPassword(ctx context.Context, userID int64, rawGrant, sessionToken, password string) error
+	SetFirstPasswordWithRecoveryCode(ctx context.Context, userID int64, rawGrant, sessionToken, password string, recoveryCodeID int64) error
 
 	ListProjects(ctx context.Context) ([]store.ProjectListEntry, error)
 	GetProject(ctx context.Context, projectID int64) (store.Project, error)
 	GetProjectBySlug(ctx context.Context, slug string) (store.Project, error)
 	GetProjectContextBySlug(ctx context.Context, slug string, mode store.Mode) (store.ProjectContext, error)
 	GetProjectContextForRead(ctx context.Context, projectID int64, mode store.Mode) (store.ProjectContext, error)
-	CreateProject(ctx context.Context, name string) (store.Project, error)
 	CreateProjectWithWorkflow(ctx context.Context, name string, workflow []store.WorkflowColumn) (store.Project, error)
-	DeleteProject(ctx context.Context, projectID int64, userID int64) error
+	DeleteProject(ctx context.Context, projectID int64, userID int64) (store.DeletedProjectSnapshot, error)
+	CheckCanManageProject(ctx context.Context, projectID int64, userID int64) error
 	UpdateProjectImage(ctx context.Context, projectID int64, userID int64, image *string, dominantColor string) error
 	UpdateProjectName(ctx context.Context, projectID int64, userID int64, name string) error
 	UpdateProjectDefaultSprintWeeks(ctx context.Context, projectID int64, userID int64, weeks int) error
-	AddWorkflowColumn(ctx context.Context, projectID int64, name string) (store.WorkflowColumn, error)
-	DeleteWorkflowColumn(ctx context.Context, projectID int64, key string) error
-	UpdateWorkflowColumn(ctx context.Context, projectID int64, key, name, color string) error
+	UpdateProjectSprintsEnabled(ctx context.Context, projectID int64, userID int64, enabled bool) error
+	UpdateProjectBoardSettings(ctx context.Context, projectID, userID int64, patch store.ProjectBoardSettingsPatch) (store.ProjectBoardSettings, error)
+	workflowapp.MutationStore
+	priorityapp.MutationStore
+	calendarapp.SourceStore
+	calendarapp.SnapshotStore
+	membershipapp.MutationStore
 	CountTodosByColumnKey(ctx context.Context, projectID int64) (map[string]int, error)
+	CountTodosByPriorityKey(ctx context.Context, projectID int64) (map[string]int, error)
+	GetProjectPriorities(ctx context.Context, projectID int64) ([]store.PriorityTier, error)
 	GetProjectRole(ctx context.Context, projectID int64, userID int64) (store.ProjectRole, error)
 	CheckProjectRole(ctx context.Context, projectID int64, userID int64, requiredRole store.ProjectRole) error
 	ListProjectMembers(ctx context.Context, projectID int64, userID int64) ([]store.ProjectMember, error)
-	AddProjectMember(ctx context.Context, requesterID, projectID, targetUserID int64, role store.ProjectRole) error
-	RemoveProjectMember(ctx context.Context, requesterID, projectID, targetUserID int64) error
-	UpdateProjectMemberRole(ctx context.Context, requesterID, projectID, targetUserID int64, role store.ProjectRole) error
 	ListAvailableUsersForProject(ctx context.Context, requesterID, projectID int64) ([]store.User, error)
 
-	GetBoard(ctx context.Context, pc *store.ProjectContext, tagFilter string, searchFilter string, sprintFilter store.SprintFilter) (store.Project, []store.TagCount, []store.WorkflowColumn, map[string][]store.Todo, error)
-	GetBoardPaged(ctx context.Context, pc *store.ProjectContext, tagFilter string, searchFilter string, sprintFilter store.SprintFilter, limitPerLane int) (store.Project, []store.TagCount, []store.WorkflowColumn, map[string][]store.Todo, map[string]store.LaneMeta, error)
+	boardapp.ReadStore
+	boardapp.LaneReadStore
+	boardapp.LegacyReadStore
 	ListTagCounts(ctx context.Context, pc *store.ProjectContext) ([]store.TagCount, error)
-	ListTodosForBoardLane(ctx context.Context, projectID int64, columnKey string, limit int, afterRank, afterID int64, tagFilter, searchFilter string, sprintFilter store.SprintFilter) ([]store.Todo, string, bool, error)
 	GetDashboardSummary(ctx context.Context, userID int64, timezone string) (store.DashboardSummary, error)
 	ListDashboardTodos(ctx context.Context, userID int64, limit int, cursor *string, sort string) ([]store.DashboardTodo, *string, error)
 	GetBacklogSize(ctx context.Context, projectID int64, mode store.Mode) ([]store.BurndownPoint, error)
@@ -165,13 +310,18 @@ type storeAPI interface {
 	GetBoardScopedTagIDByName(ctx context.Context, projectID int64, tagName string) (int64, error)
 	ResolveTagForColorUpdate(ctx context.Context, projectID int64, viewerUserID *int64, tagName string, linkTemporaryBoard bool) (int64, error)
 	UpdateTagColor(ctx context.Context, viewerUserID *int64, tagID int64, color *string) error
+	UpdateMyTagColor(ctx context.Context, userID, tagID int64, color *string) error
+	UpdateTagColorForDurableProjectByID(ctx context.Context, projectID int64, viewerUserID int64, tagID int64, color *string) error
 	UpdateTagColorForTemporaryBoard(ctx context.Context, projectID int64, viewerUserID *int64, tagID int64, color *string) error
 	UpdateTagColorForProject(ctx context.Context, projectID int64, viewerUserID *int64, tagName string, color *string, linkTemporaryBoard bool) error
+	SetViewerTagColorByName(ctx context.Context, projectID int64, viewerUserID int64, name string, color *string) error
+	DeleteMyTagByName(ctx context.Context, projectID int64, userID int64, name string) ([]int64, error)
+	DeleteMyTagByID(ctx context.Context, userID, tagID int64) ([]int64, error)
+	DeleteTagForDurableProjectByID(ctx context.Context, projectID, userID, tagID int64) ([]int64, error)
 	GetTagColor(ctx context.Context, userID int64, tagID int64) (*string, error)
 	DeleteTag(ctx context.Context, userID int64, tagID int64, isAnonymousBoard bool) error
 
-	CreateTodo(ctx context.Context, projectID int64, in store.CreateTodoInput, mode store.Mode) (store.Todo, error)
-	CreateSprint(ctx context.Context, projectID int64, name string, plannedStartAt, plannedEndAt time.Time) (store.Sprint, error)
+	sprintapp.DefinitionStore
 	ListSprints(ctx context.Context, projectID int64) ([]store.Sprint, error)
 	HasSprints(ctx context.Context, projectID int64) (bool, error)
 	ListSprintsWithTodoCount(ctx context.Context, projectID int64) ([]store.SprintWithTodoCount, error)
@@ -179,20 +329,18 @@ type storeAPI interface {
 	GetSprintByID(ctx context.Context, sprintID int64) (store.Sprint, error)
 	GetSprintByProjectNumber(ctx context.Context, projectID, number int64) (store.Sprint, error)
 	GetActiveSprintByProjectID(ctx context.Context, projectID int64) (*store.Sprint, error)
-	ActivateSprint(ctx context.Context, projectID, sprintID int64) error
-	CloseSprint(ctx context.Context, sprintID int64) error
-	UpdateSprint(ctx context.Context, sprintID int64, in store.UpdateSprintInput) error
-	DeleteSprint(ctx context.Context, projectID, sprintID int64) error
+	sprintapp.TransitionStore
+	sprintapp.DeletionStore
 	UpdateTodo(ctx context.Context, todoID int64, in store.UpdateTodoInput, mode store.Mode) (store.Todo, error)
 	DeleteTodo(ctx context.Context, todoID int64, mode store.Mode) error
 	GetProjectIDForTodo(ctx context.Context, todoID int64) (int64, error)
 	MoveTodo(ctx context.Context, todoID int64, toColumnKey string, afterID, beforeID *int64, mode store.Mode) (store.Todo, error)
-	UpdateTodoByLocalID(ctx context.Context, projectID, localID int64, in store.UpdateTodoInput, mode store.Mode) (store.Todo, error)
 	GetTodoByLocalID(ctx context.Context, projectID, localID int64, mode store.Mode) (store.Todo, error)
 	DeleteTodoByLocalID(ctx context.Context, projectID, localID int64, mode store.Mode) error
-	MoveTodoByLocalID(ctx context.Context, projectID, localID int64, toColumnKey string, afterLocalID, beforeLocalID *int64, mode store.Mode) (store.Todo, error)
-	AddLink(ctx context.Context, projectID, fromLocalID, toLocalID int64, linkType string, mode store.Mode) error
-	RemoveLink(ctx context.Context, projectID, fromLocalID, toLocalID int64, mode store.Mode) error
+	todoapp.CreateStore
+	todoapp.UpdateStore
+	todoapp.MoveStore
+	todolinkapp.MutationStore
 	ListLinksForTodo(ctx context.Context, projectID, localID int64, mode store.Mode) ([]store.TodoLinkTarget, error)
 	ListBacklinksForTodo(ctx context.Context, projectID, localID int64, mode store.Mode) ([]store.TodoLinkTarget, error)
 	SearchTodosForLinkPicker(ctx context.Context, projectID int64, q string, limit int, excludeLocalIDs []int64, mode store.Mode) ([]store.TodoLinkTarget, error)
@@ -207,6 +355,13 @@ type storeAPI interface {
 
 	GetUserPreference(ctx context.Context, userID int64, key string) (string, error)
 	SetUserPreference(ctx context.Context, userID int64, key, value string) error
+	GetEmailNotifyPref(ctx context.Context, userID int64) (store.EmailNotifyPref, error)
+	GetEmailNotifyOrgDefault(ctx context.Context) (store.EmailNotifyPref, bool, error)
+	SetEmailNotifyOrgDefault(ctx context.Context, requesterID int64, raw string) error
+	ClearEmailNotifyOrgDefault(ctx context.Context, requesterID int64) error
+	GetDefaultBoardOrgSetting(ctx context.Context) (projectID int64, role store.ProjectRole, customized bool, err error)
+	SetDefaultBoardOrgSetting(ctx context.Context, requesterID, projectID int64, role store.ProjectRole) error
+	ClearDefaultBoardOrgSetting(ctx context.Context, requesterID int64) error
 
 	// 2FA
 	CreateLogin2FAPending(ctx context.Context, userID int64, ttl time.Duration) (token string, expiresAt time.Time, err error)
@@ -222,9 +377,13 @@ type storeAPI interface {
 	ClearUserTwoFactor(ctx context.Context, userID int64) error
 	AddRecoveryCodes(ctx context.Context, userID int64, codes []string) error
 	ConsumeRecoveryCode(ctx context.Context, userID int64, code string) (bool, error)
+	MatchRecoveryCode(ctx context.Context, userID int64, code string) (int64, error)
+	ConsumeRecoveryCodeID(ctx context.Context, userID, recoveryCodeID int64) (bool, error)
 	DeleteRecoveryCodesByUser(ctx context.Context, userID int64) error
 	EncryptTOTPSecret(plaintext []byte) (string, error)
 	DecryptTOTPSecret(encrypted string) ([]byte, error)
+	EncryptSecret(plaintext []byte) (string, error)
+	DecryptSecret(encrypted string) ([]byte, error)
 
 	// Webhooks
 	CreateWebhook(ctx context.Context, userID int64, in store.CreateWebhookInput) (store.Webhook, error)
@@ -333,56 +492,327 @@ func NewServer(st storeAPI, opts Options) *Server {
 	if authRateLimit == nil {
 		authRateLimit = ratelimit.New(10, time.Minute)
 	}
+	oauthDCRRateLimit := opts.OAuthDCRRateLimit
+	if oauthDCRRateLimit == nil {
+		oauthDCRRateLimit = ratelimit.New(10, time.Minute)
+	}
+	oauthTokenRateLimit := opts.OAuthTokenRateLimit
+	if oauthTokenRateLimit == nil {
+		oauthTokenRateLimit = ratelimit.New(60, time.Minute)
+	}
 	hub := NewHub(defaultSubscriberBuffer)
-	sseBridgeConsumer := newSSEBridge(hub)
+	creatorNotificationAuthorizer := todoapp.NewCreatorNotificationAuthorizationService(st)
+	sseBridgeConsumer := newSSEBridge(hub, creatorNotificationAuthorizer)
 	whQueue := newWebhookQueue(logger)
 	whDispatcher := newWebhookDispatcher(st, whQueue, logger)
 	pushDebug := opts.PushDebug
-	vapidPub := strings.TrimSpace(opts.VAPIDPublicKey)
-	pushVapidConfigured := PushConfigured(mode, opts.VAPIDPublicKey, opts.VAPIDPrivateKey)
-	pushNotifier := newPushNotifier(st, logger, opts.VAPIDPublicKey, opts.VAPIDPrivateKey, opts.VAPIDSubscriber, pushDebug)
-	fanout := eventbus.NewFanout(sseBridgeConsumer, whDispatcher, pushNotifier)
+	preparedPush := prepareWebPushConfiguration(mode, opts.VAPIDPublicKey, opts.VAPIDPrivateKey, opts.VAPIDSubscriber)
+	pushVapidConfigured := preparedPush.status.State == pushStateEnabled
+	if preparedPush.status.Reason != nil {
+		logger.Printf("push: disabled: %s", *preparedPush.status.Reason)
+	}
+	pushNotifier := newPushNotifier(st, logger, preparedPush.publicKey, preparedPush.privateKey, preparedPush.subscriber, pushVapidConfigured, pushDebug)
+
+	smtpConfigured := SMTPConfigured(opts.SMTPHost, opts.SMTPPort, opts.SMTPFrom)
+	transactionalMailQueue := newTransactionalMailQueue(logger)
+	notificationMailQueue := newNotificationMailQueue(logger)
+	publicBaseURL := config.NormalizeBaseURL(opts.PublicBaseURL)
+	emailNotifier := newEmailNotifier(st, notificationMailQueue, publicBaseURL, smtpConfigured, logger)
+
+	fanout := eventbus.NewFanout(sseBridgeConsumer, whDispatcher, pushNotifier, emailNotifier)
 	whWorker := newWebhookWorker(whQueue, logger)
 	workerCtx, workerCancel := context.WithCancel(context.Background())
+	webhookDone := whWorker.Done()
 	go whWorker.Run(workerCtx)
 	passwordResetAdminLimiter := ratelimit.New(10, time.Minute)
+	passwordResetRequestLimiter := ratelimit.New(5, time.Minute)
+	firstPasswordStartLimiter := ratelimit.New(5, time.Minute)
+	firstPasswordFinishLimiter := ratelimit.New(5, time.Minute)
+	oidcLinkStartLimiter := ratelimit.New(5, time.Minute)
+	currentPasswordLimiter := ratelimit.New(5, time.Minute)
+	secondFactorLimiter := ratelimit.New(5, time.Minute)
+	totpLimiter := ratelimit.New(5, time.Minute)
+	recoveryCodeLimiter := ratelimit.New(5, time.Minute)
+
+	var transactionalMailWorker *mailWorker
+	var transactionalMailCancel context.CancelFunc
+	var transactionalMailDone <-chan struct{}
+	var notificationMailWorker *mailWorker
+	var notificationMailCancel context.CancelFunc
+	var notificationMailDone <-chan struct{}
+	if smtpConfigured {
+		sender := mailer.New(mailer.Config{
+			Host:     opts.SMTPHost,
+			Port:     opts.SMTPPort,
+			Username: opts.SMTPUsername,
+			Password: opts.SMTPPassword,
+			From:     opts.SMTPFrom,
+			TLSMode:  opts.SMTPTLSMode,
+			Debug:    opts.SMTPDebug,
+			Logger:   logger,
+		})
+		transactionalMailWorker = newMailWorkerWithKind(transactionalMailQueue, sender, logger, "transactional mail")
+		transactionalCtx, transactionalCancel := context.WithCancel(context.Background())
+		transactionalMailCancel = transactionalCancel
+		transactionalMailDone = transactionalMailWorker.Done()
+		go transactionalMailWorker.Run(transactionalCtx)
+
+		notificationMailWorker = newMailWorkerWithKind(notificationMailQueue, sender, logger, "notification mail")
+		notificationCtx, notificationCancel := context.WithCancel(context.Background())
+		notificationMailCancel = notificationCancel
+		notificationMailDone = notificationMailWorker.Done()
+		go notificationMailWorker.Run(notificationCtx)
+	}
 
 	var encKey []byte
 	if opts.EncryptionKey != nil {
 		encKey = opts.EncryptionKey
 	}
-
-	return &Server{
-		store:                     st,
-		logger:                    logger,
-		maxBody:                   maxBody,
-		maxTrelloImportBody:       maxTrelloImportBody,
-		mode:                      mode,
-		dataDir:                   strings.TrimSpace(opts.DataDir),
-		hub:                       hub,
-		sink:                      hub,
-		fanout:                    fanout,
-		webhookQueue:              whQueue,
-		webhookCancel:             workerCancel,
-		authRateLimit:             authRateLimit,
-		encryptionKey:             encKey,
-		oidcService:               opts.OIDCService,
-		passwordResetAdminLimiter: passwordResetAdminLimiter,
-		webFS:                     webFS,
-		fileSrv:                   http.FileServer(http.FS(webFS)),
-		indexHTML:                 indexHTML,
-		landingHTML:               landingHTML,
-		landingHTMLByLocale:       landingHTMLByLocale,
-		swJS:                      swJS,
-		mcpHandler:                opts.MCPHandler,
-		agoraHandler:              opts.AgoraHandler,
-		vapidPublicKey:            vapidPub,
-		pushVapidConfigured:       pushVapidConfigured,
-		pushDebug:                 pushDebug,
-		wallEnabled:               opts.WallEnabled,
-		markdownNotesEnabled:      opts.MarkdownNotesEnabled,
-		mermaidNotesEnabled:       opts.MermaidNotesEnabled && opts.MarkdownNotesEnabled,
+	publicOrigin := opts.PublicOrigin
+	if publicOrigin == nil {
+		publicOrigin = publicorigin.New(publicBaseURL, opts.TrustProxy)
 	}
+
+	server := &Server{
+		store:                         st,
+		creatorNotificationAuthorizer: creatorNotificationAuthorizer,
+		boardReads: boardapp.NewReadService(boardapp.ReadServiceDependencies{
+			Initial:      st,
+			Lane:         st,
+			LegacyAccess: st,
+			Legacy:       st,
+			Priorities:   st,
+			SlugAccess:   st,
+			SlugSprints:  st,
+		}),
+		logger:                      logger,
+		maxBody:                     maxBody,
+		maxTrelloImportBody:         maxTrelloImportBody,
+		mode:                        mode,
+		dataDir:                     strings.TrimSpace(opts.DataDir),
+		hub:                         hub,
+		sink:                        hub,
+		fanout:                      fanout,
+		webhookQueue:                whQueue,
+		webhookWorker:               whWorker,
+		webhookCancel:               workerCancel,
+		webhookDone:                 webhookDone,
+		transactionalMailQueue:      transactionalMailQueue,
+		transactionalMailWorker:     transactionalMailWorker,
+		transactionalMailCancel:     transactionalMailCancel,
+		transactionalMailDone:       transactionalMailDone,
+		notificationMailQueue:       notificationMailQueue,
+		notificationMailWorker:      notificationMailWorker,
+		notificationMailCancel:      notificationMailCancel,
+		notificationMailDone:        notificationMailDone,
+		emailNotifier:               emailNotifier,
+		authRateLimit:               authRateLimit,
+		oauthDCRRateLimit:           oauthDCRRateLimit,
+		oauthTokenRateLimit:         oauthTokenRateLimit,
+		encryptionKey:               encKey,
+		oidcService:                 opts.OIDCService,
+		passwordResetAdminLimiter:   passwordResetAdminLimiter,
+		passwordResetRequestLimiter: passwordResetRequestLimiter,
+		firstPasswordStartLimiter:   firstPasswordStartLimiter,
+		firstPasswordFinishLimiter:  firstPasswordFinishLimiter,
+		oidcLinkStartLimiter:        oidcLinkStartLimiter,
+		currentPasswordLimiter:      currentPasswordLimiter,
+		secondFactorLimiter:         secondFactorLimiter,
+		totpLimiter:                 totpLimiter,
+		recoveryCodeLimiter:         recoveryCodeLimiter,
+		smtpConfigured:              smtpConfigured,
+		publicBaseURL:               publicBaseURL,
+		trustProxy:                  opts.TrustProxy,
+		publicOrigin:                publicOrigin,
+		webFS:                       webFS,
+		fileSrv:                     http.FileServer(http.FS(webFS)),
+		indexHTML:                   indexHTML,
+		landingHTML:                 landingHTML,
+		landingHTMLByLocale:         landingHTMLByLocale,
+		swJS:                        swJS,
+		mcpHandler:                  opts.MCPHandler,
+		agoraHandler:                opts.AgoraHandler,
+		vapidPublicKey:              preparedPush.publicKey,
+		pushVapidConfigured:         pushVapidConfigured,
+		pushStatus:                  preparedPush.status,
+		pushDebug:                   pushDebug,
+		wallEnabled:                 opts.WallEnabled,
+		markdownNotesEnabled:        opts.MarkdownNotesEnabled,
+		mermaidNotesEnabled:         opts.MermaidNotesEnabled && opts.MarkdownNotesEnabled,
+	}
+	server.wallNoteMutations = wallapp.NewRESTNoteService(wallapp.RESTNoteServiceDependencies{
+		Roles:     st,
+		Mutations: st,
+		Refresh:   wallRefreshPublisher{server: server},
+	})
+	server.wallReplacements = wallapp.NewRESTReplacementService(wallapp.RESTReplacementServiceDependencies{
+		Roles:        st,
+		Replacements: st,
+		Refresh:      wallRefreshPublisher{server: server},
+	})
+	server.wallEdgeMutations = wallapp.NewRESTEdgeService(wallapp.RESTEdgeServiceDependencies{
+		Roles:     st,
+		Mutations: st,
+		Refresh:   wallRefreshPublisher{server: server},
+	})
+	server.wallTransientMutations = wallapp.NewRESTTransientService(wallapp.RESTTransientServiceDependencies{
+		Roles:     st,
+		Publisher: wallTransientPublisher{server: server},
+	})
+	server.projectCreations = projectapp.NewRESTDurableCreationService(st)
+	server.anonymousBoardCreations = projectapp.NewAnonymousBoardCreationService(st)
+	server.projectUpdates = projectapp.NewRESTUpdateService(projectapp.RESTUpdateServiceDependencies{
+		Projects:  st,
+		Images:    st,
+		Names:     st,
+		Publisher: projectUpdatePublisher{server: server},
+	})
+	server.projectDeletions = projectapp.NewRESTDeletionService(projectapp.RESTDeletionServiceDependencies{
+		Projects:  st,
+		Publisher: projectDeletionPublisher{server: server},
+	})
+	server.projectClaims = projectapp.NewRESTClaimService(projectapp.RESTClaimServiceDependencies{
+		Claims:    st,
+		Publisher: projectClaimPublisher{server: server},
+	})
+	boardRefreshPublisher := todoapp.BoardRefreshPublisherFunc(func(ctx context.Context, projectID int64, reason string, entity refresh.Entity) {
+		server.emitRefreshNeeded(ctx, projectID, reason, entity)
+	})
+	creatorRequestPublisher := todoapp.CreatorNotificationRequestPublisher(server)
+	server.todoCreates = todoapp.NewCreateService(todoapp.CreateServiceDependencies{
+		Create:  st,
+		Refresh: boardRefreshPublisher,
+	})
+	server.todoDeletes = todoapp.NewDeleteService(todoapp.DeleteServiceDependencies{
+		Delete:  st,
+		Refresh: boardRefreshPublisher,
+	})
+	server.todoMoves = todoapp.NewMoveService(todoapp.MoveServiceDependencies{
+		Move:            st,
+		Refresh:         boardRefreshPublisher,
+		CreatorRequests: creatorRequestPublisher,
+	})
+	server.todoUpdates = todoapp.NewUpdateService(todoapp.UpdateServiceDependencies{
+		Update:          st,
+		Refresh:         boardRefreshPublisher,
+		CreatorRequests: creatorRequestPublisher,
+	})
+	server.todoLegacyDeletes = todoapp.NewLegacyDeleteService(todoapp.LegacyDeleteServiceDependencies{
+		Projects: st,
+		Delete:   st,
+		Refresh:  boardRefreshPublisher,
+	})
+	server.todoLegacyMoves = todoapp.NewLegacyMoveService(todoapp.LegacyMoveServiceDependencies{
+		Move:            st,
+		Refresh:         boardRefreshPublisher,
+		Projects:        st,
+		CreatorRequests: creatorRequestPublisher,
+	})
+	server.todoLegacyUpdates = todoapp.NewLegacyUpdateService(todoapp.LegacyUpdateServiceDependencies{
+		Update:          st,
+		Refresh:         boardRefreshPublisher,
+		Projects:        st,
+		CreatorRequests: creatorRequestPublisher,
+	})
+	server.todoLinkMutations = todolinkapp.NewRESTMutationService(todolinkapp.RESTMutationServiceDependencies{
+		Sources:   st,
+		Mutations: st,
+		Publisher: todoLinkMutationPublisher{server: server},
+	})
+	server.sprintDefinitions = sprintapp.NewRESTDefinitionService(sprintapp.RESTDefinitionServiceDependencies{
+		Roles:       st,
+		Definitions: st,
+		Publisher:   sprintDefinitionPublisher{server: server},
+	})
+	server.sprintLifecycle = sprintapp.NewRESTLifecycleService(sprintapp.RESTLifecycleServiceDependencies{
+		Roles:       st,
+		Sprints:     st,
+		Transitions: st,
+		Publisher:   sprintTransitionPublisher{server: server},
+	})
+	server.sprintDeletions = sprintapp.NewRESTDeletionService(sprintapp.RESTDeletionServiceDependencies{
+		Roles:     st,
+		Deletions: st,
+		Publisher: sprintDeletionPublisher{server: server},
+	})
+	server.workflowMutations = workflowapp.NewRESTMutationService(workflowapp.RESTMutationServiceDependencies{
+		Roles:     st,
+		Mutations: st,
+		Refresh: workflowapp.BoardRefreshPublisherFunc(func(ctx context.Context, projectID int64, reason string, entity refresh.Entity) {
+			server.emitRefreshNeeded(ctx, projectID, reason, entity)
+		}),
+	})
+	server.priorityMutations = priorityapp.NewRESTMutationService(priorityapp.RESTMutationServiceDependencies{
+		Roles:     st,
+		Mutations: st,
+		Refresh: priorityapp.BoardRefreshPublisherFunc(func(ctx context.Context, projectID int64, reason string, entity refresh.Entity) {
+			server.emitRefreshNeeded(ctx, projectID, reason, entity)
+		}),
+	})
+	refreshPublisher := calendarapp.BoardRefreshPublisherFunc(func(ctx context.Context, projectID int64, reason string, entity refresh.Entity) {
+		server.emitRefreshNeeded(ctx, projectID, reason, entity)
+	})
+	server.calendarSources = calendarapp.NewRESTService(calendarapp.RESTServiceDependencies{
+		Projects:      st,
+		Roles:         st,
+		Cipher:        st,
+		Sources:       st,
+		Refresh:       refreshPublisher,
+		AllowLoopback: opts.AllowLoopbackCalendarFeeds,
+	})
+	server.boardSettings = projectsettingsapp.NewRESTService(projectsettingsapp.RESTServiceDependencies{
+		Mutations: st,
+		Refresh: projectsettingsapp.BoardRefreshPublisherFunc(func(ctx context.Context, projectID int64, reason string, entity refresh.Entity) {
+			server.emitRefreshNeeded(ctx, projectID, reason, entity)
+		}),
+	})
+	fetcher := opts.CalendarFeedFetcher
+	if fetcher == nil {
+		fetcher = calendarapp.NewHTTPFetcher(opts.AllowLoopbackCalendarFeeds)
+	}
+	server.agenda = calendarapp.NewAgendaService(calendarapp.AgendaServiceDependencies{
+		Sources:   st,
+		Snapshots: st,
+		Cipher:    st,
+		Fetcher:   fetcher,
+		Refresh:   refreshPublisher,
+	})
+	server.membershipMutations = membershipapp.NewRESTMutationService(membershipapp.RESTMutationServiceDependencies{
+		Mutations: st,
+		Members:   st,
+		Publisher: membershipMutationPublisher{server: server},
+	})
+	server.tagColors = tagapp.NewRESTColorService(tagapp.RESTColorServiceDependencies{
+		MineColor:          st,
+		DurableIDColor:     st,
+		TemporaryIDColor:   st,
+		DurableNameColor:   st,
+		TemporaryNameColor: st,
+		Publisher:          tagColorPublisher{server: server},
+	})
+	server.tagDeletions = tagapp.NewRESTDeletionService(tagapp.RESTDeletionServiceDependencies{
+		MineID:        st,
+		MineName:      st,
+		DurableID:     st,
+		Rows:          st,
+		BoardNames:    st,
+		PersonalNames: st,
+		Publisher:     tagDeletionPublisher{server: server},
+	})
+	server.userCreations = useradminapp.NewRESTCreationService(useradminapp.RESTCreationServiceDependencies{
+		Creations: st,
+	})
+	server.userRoleMutations = useradminapp.NewRESTRoleService(useradminapp.RESTRoleServiceDependencies{
+		Mutations:      st,
+		ProjectionRead: st,
+	})
+	server.userDeletions = useradminapp.NewRESTDeletionService(useradminapp.RESTDeletionServiceDependencies{
+		Deletions: st,
+	})
+	if opts.MCPHandler != nil {
+		opts.MCPHandler.BindCreatorNotificationRequestPublisher(creatorRequestPublisher)
+	}
+	return server
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -417,6 +847,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if s.mcpHandler != nil && (r.URL.Path == "/mcp" || strings.HasPrefix(r.URL.Path, "/mcp/")) {
 		s.mcpHandler.ServeHTTP(w, r)
+		return
+	}
+
+	if r.URL.Path == "/.well-known/oauth-protected-resource" || r.URL.Path == publicorigin.MCPResourceMetadataPath {
+		s.handleOAuthProtectedResourceMetadata(w, r)
+		return
+	}
+	if r.URL.Path == "/.well-known/oauth-authorization-server" {
+		s.handleOAuthASMetadata(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/oauth/") {
+		s.handleOAuth(w, r)
 		return
 	}
 
@@ -468,10 +911,58 @@ func (s *Server) storeMode() store.Mode {
 	return mode
 }
 
-// Close cancels background workers. Call from main on shutdown.
-func (s *Server) Close() {
+// Close stops accepting new delivery-queue entries, links each worker's
+// retry context to ctx (so observing ctx cancellation stops further
+// drain/retry work—including an already-running flush), cancels each
+// worker's accept loop, and waits (also bounded by ctx) for the drain to
+// finish. An in-flight send may complete under its own transport timeout.
+// Once a worker observes close-context cancellation, it starts no further
+// queued item or send attempt. Call from main on shutdown.
+func (s *Server) Close(ctx context.Context) {
+	if s.webhookQueue != nil {
+		s.webhookQueue.Seal()
+	}
+	if s.transactionalMailQueue != nil {
+		s.transactionalMailQueue.Seal()
+	}
+	if s.notificationMailQueue != nil {
+		s.notificationMailQueue.Seal()
+	}
+	if s.webhookWorker != nil {
+		s.webhookWorker.beginShutdown(ctx)
+	}
+	if s.transactionalMailWorker != nil {
+		s.transactionalMailWorker.beginShutdown(ctx)
+	}
+	if s.notificationMailWorker != nil {
+		s.notificationMailWorker.beginShutdown(ctx)
+	}
 	if s.webhookCancel != nil {
 		s.webhookCancel()
+	}
+	if s.transactionalMailCancel != nil {
+		s.transactionalMailCancel()
+	}
+	if s.notificationMailCancel != nil {
+		s.notificationMailCancel()
+	}
+
+	for _, w := range []struct {
+		name string
+		done <-chan struct{}
+	}{
+		{"webhook", s.webhookDone},
+		{"transactional mail", s.transactionalMailDone},
+		{"notification mail", s.notificationMailDone},
+	} {
+		if w.done == nil {
+			continue
+		}
+		select {
+		case <-w.done:
+		case <-ctx.Done():
+			s.logger.Printf("shutdown: %s worker flush did not finish before deadline", w.name)
+		}
 	}
 }
 
@@ -484,20 +975,98 @@ func (s *Server) PublishEvent(ctx context.Context, e eventbus.Event) {
 	_ = s.fanout.Publish(ctx, e)
 }
 
+// PublishCreatorNotificationRequest records the internal consideration request,
+// then performs the Phase 3 fresh-access check. Neither internal event is
+// exposed verbatim. SSE and creator email independently treat the authorized
+// event as a candidate and repeat current-access checks at their delivery
+// boundaries; push and webhooks remain excluded.
+func (s *Server) PublishCreatorNotificationRequest(ctx context.Context, request todoapp.CreatorNotificationRequest) {
+	payload, err := json.Marshal(eventbus.TodoCreatorNotificationRequestedPayload{
+		ProjectID:             request.ProjectID,
+		ProjectSlug:           request.ProjectSlug,
+		TodoID:                request.TodoID,
+		LocalID:               request.LocalID,
+		Title:                 request.Title,
+		ActivityReason:        request.ActivityReason,
+		FromName:              request.FromName,
+		ToName:                request.ToName,
+		CreatedByUserID:       request.CreatedByUserID,
+		ActorUserID:           request.ActorUserID,
+		MaterialChanged:       request.MaterialChanged,
+		AssignmentChanged:     request.AssignmentChanged,
+		ToAssigneeUserID:      request.ToAssigneeUserID,
+		CardActivityCandidate: request.CardActivityCandidate,
+	})
+	if err != nil {
+		return
+	}
+	s.PublishEvent(ctx, eventbus.Event{
+		Type:      eventbus.TodoCreatorNotificationRequestedEventType,
+		ProjectID: request.ProjectID,
+		Payload:   payload,
+	})
+
+	authorized, ok, err := s.creatorNotificationAuthorizer.Authorize(ctx, request)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Printf(
+				"creator notification authorization lookup failed project_id=%d recipient_user_id=%d: %v",
+				request.ProjectID,
+				request.CreatedByUserID,
+				err,
+			)
+		}
+		return
+	}
+	if !ok {
+		return
+	}
+	s.publishAuthorizedCreatorNotification(ctx, authorized)
+}
+
+func (s *Server) publishAuthorizedCreatorNotification(ctx context.Context, authorized todoapp.AuthorizedCreatorNotification) {
+	payload, err := json.Marshal(eventbus.TodoCreatorNotificationRecipientAuthorizedPayload{
+		ProjectID:             authorized.ProjectID,
+		ProjectSlug:           authorized.ProjectSlug,
+		TodoID:                authorized.TodoID,
+		LocalID:               authorized.LocalID,
+		Title:                 authorized.Title,
+		ActivityReason:        authorized.ActivityReason,
+		FromName:              authorized.FromName,
+		ToName:                authorized.ToName,
+		RecipientUserID:       authorized.RecipientUserID,
+		ActorUserID:           authorized.ActorUserID,
+		MaterialChanged:       authorized.MaterialChanged,
+		AssignmentChanged:     authorized.AssignmentChanged,
+		ToAssigneeUserID:      authorized.ToAssigneeUserID,
+		CardActivityCandidate: authorized.CardActivityCandidate,
+	})
+	if err != nil {
+		return
+	}
+	s.PublishEvent(ctx, eventbus.Event{
+		Type:      eventbus.TodoCreatorNotificationRecipientAuthorizedEventType,
+		ProjectID: authorized.ProjectID,
+		Payload:   payload,
+	})
+}
+
 // PublishTodoAssigned emits a "todo.assigned" event through the event bus.
 // Designed to be passed to store.SetTodoAssignedPublisher.
-func (s *Server) PublishTodoAssigned(ctx context.Context, projectID, todoID, localID int64, title, projectSlug string, from, to *int64, actorUserID int64) {
+func (s *Server) PublishTodoAssigned(ctx context.Context, projectID, todoID, localID int64, title, projectSlug, activityReason string, from, to *int64, actorUserID int64, facts store.TodoAssignedMutationFacts) {
 	payload, _ := json.Marshal(eventbus.TodoAssignedPayload{
 		ProjectID:       projectID,
 		ProjectSlug:     projectSlug,
 		TodoID:          todoID,
 		LocalID:         localID,
 		Title:           title,
+		Reason:          "todo_assigned",
+		ActivityReason:  activityReason,
 		FromAssigneeUID: from,
 		ToAssigneeUID:   to,
 		ActorUserID:     actorUserID,
 	})
-	s.PublishEvent(ctx, eventbus.Event{
+	s.PublishEvent(withTodoAssignedMutationFacts(ctx, facts), eventbus.Event{
 		Type:      "todo.assigned",
 		ProjectID: projectID,
 		Payload:   payload,

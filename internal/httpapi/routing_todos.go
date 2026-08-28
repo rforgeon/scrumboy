@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
+	todoapp "scrumboy/internal/application/todo"
 	"scrumboy/internal/store"
 )
 
@@ -52,6 +54,7 @@ func (s *Server) handleTodosPatchOrDelete(w http.ResponseWriter, r *http.Request
 			Tags             []string `json:"tags"`
 			EstimationPoints *int64   `json:"estimationPoints"`
 			AssigneeUserID   *int64   `json:"assigneeUserId"`
+			PriorityKey      *string  `json:"priorityKey"`
 		}
 		payload, err := json.Marshal(raw)
 		if err != nil {
@@ -62,34 +65,41 @@ func (s *Server) handleTodosPatchOrDelete(w http.ResponseWriter, r *http.Request
 			writeValidationError(w, "invalid json payload", "invalid_json", nil)
 			return true
 		}
-		todo, err := s.store.UpdateTodo(s.requestContext(r), todoID, store.UpdateTodoInput{
+		prepared := s.todoLegacyUpdates.Prepare(s.requestContext(r), todoapp.LegacyUpdateTarget{
+			Mode: s.storeMode(),
+		})
+		result, err := prepared.Update(todoapp.LegacyUpdateCommand{
+			TodoID:           todoID,
 			Title:            in.Title,
 			Body:             in.Body,
 			Tags:             in.Tags,
 			EstimationPoints: in.EstimationPoints,
 			AssigneeUserID:   in.AssigneeUserID,
-		}, s.storeMode())
+			PriorityKey: todoapp.Field[*string]{
+				Present: raw["priorityKey"] != nil,
+				Value:   in.PriorityKey,
+			},
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		if !todo.AssignmentChanged {
-			s.emitRefreshNeeded(r.Context(), todo.ProjectID, "todo_updated")
-		}
-		writeJSON(w, http.StatusOK, todoToJSON(todo))
+		writeJSON(w, http.StatusOK, s.legacyTodoMutationJSON(s.requestContext(r), result.Todo))
 		return true
 
 	case http.MethodDelete:
-		projectID, err := s.store.GetProjectIDForTodo(s.requestContext(r), todoID)
+		prepared, err := s.todoLegacyDeletes.Prepare(s.requestContext(r), todoapp.LegacyDeleteTarget{
+			TodoID: todoID,
+			Mode:   s.storeMode(),
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		if err := s.store.DeleteTodo(s.requestContext(r), todoID, s.storeMode()); err != nil {
+		if err := prepared.Delete(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), projectID, "todo_deleted")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 
@@ -122,12 +132,32 @@ func (s *Server) handleTodosMove(w http.ResponseWriter, r *http.Request, rest []
 		writeValidationError(w, "missing toColumnKey", "missing_to_column_key", map[string]any{"field": "toColumnKey"})
 		return true
 	}
-	todo, err := s.store.MoveTodo(s.requestContext(r), todoID, toColumnKey, in.AfterID, in.BeforeID, s.storeMode())
+	prepared := s.todoLegacyMoves.Prepare(s.requestContext(r), todoapp.LegacyMoveTarget{
+		Mode: s.storeMode(),
+	})
+	result, err := prepared.Move(todoapp.LegacyMoveCommand{
+		TodoID:       todoID,
+		ToColumnKey:  toColumnKey,
+		AfterTodoID:  in.AfterID,
+		BeforeTodoID: in.BeforeID,
+	})
 	if err != nil {
 		writeStoreErr(w, err, true)
 		return true
 	}
-	s.emitRefreshNeeded(r.Context(), todo.ProjectID, "todo_moved")
-	writeJSON(w, http.StatusOK, todoToJSON(todo))
+	writeJSON(w, http.StatusOK, s.legacyTodoMutationJSON(s.requestContext(r), result.Todo))
 	return true
+}
+
+// legacyTodoMutationJSON keeps response-only capability projection from
+// changing the outcome of an already-committed numeric compatibility
+// mutation. If capability cannot be read, suppress the sprint assignment so
+// the response fails closed without reporting a transport failure.
+func (s *Server) legacyTodoMutationJSON(ctx context.Context, todo store.Todo) todoJSON {
+	project, err := s.store.GetProject(ctx, todo.ProjectID)
+	if err != nil {
+		todo.SprintID = nil
+		return todoToJSON(todo)
+	}
+	return todoToJSONForProject(todo, project)
 }

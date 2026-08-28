@@ -4,11 +4,12 @@
 
 **Agora** is a small HTTP **edge adapter** in front of Scrumboy’s existing MCP (Model Context Protocol) support. It exposes two paths that return a fixed JSON **envelope** (`ok` / `result` / `error`) suited for **Agoragentic v1**-style listings, while the real tool catalog and tool execution still run on Scrumboy’s **unchanged** MCP implementation.
 
-You do **not** call Agora instead of MCP for other clients. **Claude, curl, and MCP-style clients** that already use `GET /mcp`, `POST /mcp`, or `POST /mcp/rpc` should keep using those—behavior there is the same with or without Agora enabled.
+You do **not** call Agora instead of MCP for native clients. Cursor, Claude Code, and other Streamable HTTP clients must use `/mcp/rpc`; legacy Scrumboy integrations keep using `/mcp`.
 
 | Surface | Role |
 |--------|------|
-| **`/mcp`**, **`/mcp/rpc`** | Canonical Scrumboy MCP: legacy and JSON-RPC tools. |
+| **`/mcp`** | Legacy Scrumboy bootstrap and `{tool,input}` API. |
+| **`/mcp/rpc`** | Canonical MCP Streamable HTTP transport and sole OAuth protected resource. |
 | **`/agora/v1/discover`**, **`/agora/v1/invoke`** | Agoragentic-oriented adapter: same tools in-process, different URL and response envelope. |
 
 The adapter does **not** reimplement tools. It forwards each call to the same in-process **JSON-RPC** flow as `POST /mcp/rpc` (`tools/list` and `tools/call`), reusing the same server handler and auth as a normal MCP request.
@@ -41,12 +42,12 @@ A minimal machine-readable stub for these two listings is in [`docs/examples/ago
 
 ## Authentication
 
-Agora uses the **same rules as `POST /mcp/rpc`**:
+Agora preserves the non-OAuth authentication methods used by existing integrations:
 
 - **Session:** send `Cookie: scrumboy_session=…` when the user is signed in through the app.
 - **API token (full / normal mode):** `Authorization: Bearer <token>` (the token string Scrumboy issues, e.g. `sb_…`).
 
-The adapter **does not** add or strip credentials. It passes your request through to the MCP stack, so an invalid or missing Bearer token behaves like a direct `tools/call` (e.g. tool error text for auth failures, depending on tool and mode). See `docs/mcp.md` for full MCP auth behavior, anonymous mode, and bootstrap edge cases.
+The adapter passes cookies and static API tokens to the in-process MCP tool stack. It deliberately disables OAuth-token lookup: an access token bound to `/mcp/rpc` cannot authorize `/agora/v1/*`, and Agora emits no MCP OAuth discovery challenge. Invalid credentials return a 401 Agora error envelope and never fall back to a cookie. See `docs/mcp.md` for the canonical MCP auth behavior, anonymous mode, and bootstrap edge cases.
 
 ---
 
@@ -120,7 +121,7 @@ curl -sS -X POST 'https://YOUR_HOST/agora/v1/discover' \
   "result": {
     "tools": [
       {
-        "name": "system.getCapabilities",
+        "name": "system_getCapabilities",
         "description": "…",
         "inputSchema": { }
       }
@@ -143,7 +144,7 @@ Each tool is whatever MCP `tools/list` provides. The field name is **`inputSchem
 - **Method:** `POST`
 - **Header:** `Content-Type: application/json`
 - **Body:** JSON object with **exactly** these top-level fields for normal use:
-  - **`tool`** (string, required) — same name as in the catalog, e.g. `projects.list`
+  - **`tool`** (string, required) — same name as in the catalog, e.g. `projects_list`
   - **`arguments`** (required) — a JSON **object** for tool inputs, or the JSON value **`null`**, which the server treats like **`{}`** for the underlying call. Unknown top-level fields are **rejected** (strict decode).
 
 **Example**
@@ -152,7 +153,7 @@ Each tool is whatever MCP `tools/list` provides. The field name is **`inputSchem
 curl -sS -X POST 'https://YOUR_HOST/agora/v1/invoke' \
   -H 'Content-Type: application/json' \
   -H 'Cookie: scrumboy_session=YOUR_SESSION' \
-  -d '{"tool":"system.getCapabilities","arguments":{}}'
+  -d '{"tool":"system_getCapabilities","arguments":{}}'
 ```
 
 **Success `result`**
@@ -177,7 +178,7 @@ Always **`null`**, with **`error.message`** (and sometimes **`code` / `data`**) 
 
 5. **Do not assume** the adapter replaces MCP documentation for tool **input** validation—each tool’s **`inputSchema`** in discover describes allowed keys; the server may still return tool errors for bad inputs.
 
-6. For **integration listings**, align your static schema (e.g. `arguments: { "type": "object" }`) with the runtime rule that **JSON `null` for `arguments` is allowed** and normalized to an empty object.
+6. For **integration listings**, align your static schema with the runtime rule that **JSON `null` for `arguments` is allowed** and normalized to an empty object (see [`agoragentic-manifest.json`](examples/agoragentic-manifest.json): `arguments` as `anyOf` object or null).
 
 ---
 

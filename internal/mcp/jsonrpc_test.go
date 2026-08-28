@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 )
 
@@ -17,15 +18,29 @@ func doJSONRPC(t *testing.T, client *http.Client, baseURL string, body any) (*ht
 		t.Fatalf("encode jsonrpc body: %v", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/mcp/rpc", &buf)
-	if err != nil {
-		t.Fatalf("new jsonrpc request: %v", err)
+	bodyBytes := append([]byte(nil), buf.Bytes()...)
+	do := func(session *http.Cookie) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/mcp/rpc", bytes.NewReader(bodyBytes))
+		if err != nil {
+			t.Fatalf("new jsonrpc request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+		if session != nil {
+			req.AddCookie(session)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("do jsonrpc request: %v", err)
+		}
+		return resp
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("do jsonrpc request: %v", err)
+	resp := do(nil)
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp.Body.Close()
+		session := ensureJSONRPCTestSession(t, client, baseURL)
+		resp = do(session)
 	}
 	defer resp.Body.Close()
 
@@ -45,6 +60,46 @@ func doJSONRPC(t *testing.T, client *http.Client, baseURL string, body any) (*ht
 	return resp, out
 }
 
+func ensureJSONRPCTestSession(t *testing.T, client *http.Client, baseURL string) *http.Cookie {
+	t.Helper()
+	post := func(path string, payload map[string]any) *http.Response {
+		var body bytes.Buffer
+		if err := json.NewEncoder(&body).Encode(payload); err != nil {
+			t.Fatalf("encode auth payload: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, baseURL+path, &body)
+		if err != nil {
+			t.Fatalf("new auth request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Scrumboy", "1")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("authenticate JSON-RPC test client: %v", err)
+		}
+		return resp
+	}
+	payload := map[string]any{"email": "owner@example.com", "password": "password123", "name": "Owner"}
+	resp := post("/api/auth/bootstrap", payload)
+	if resp.StatusCode != http.StatusCreated {
+		resp.Body.Close()
+		resp = post("/api/auth/login", map[string]any{"email": payload["email"], "password": payload["password"]})
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		t.Fatalf("test authentication status = %d", resp.StatusCode)
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "scrumboy_session" {
+			return cookie
+		}
+	}
+	// A client with a cookie jar may have retained the session without
+	// exposing it on a second login response. In that case the retry can rely
+	// on the jar and does not need an explicit Cookie header.
+	return nil
+}
+
 func TestJSONRPC_InitializeHandshake(t *testing.T) {
 	ts, _, cleanup := newTestServer(t, "full")
 	defer cleanup()
@@ -55,7 +110,7 @@ func TestJSONRPC_InitializeHandshake(t *testing.T) {
 		"id":      1,
 		"method":  "initialize",
 		"params": map[string]any{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": "2025-11-25",
 			"capabilities":    map[string]any{},
 			"clientInfo": map[string]any{
 				"name":    "test-client",
@@ -78,8 +133,8 @@ func TestJSONRPC_InitializeHandshake(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected result object, got %v", out["result"])
 	}
-	if result["protocolVersion"] != "2024-11-05" {
-		t.Fatalf("expected protocolVersion 2024-11-05, got %v", result["protocolVersion"])
+	if result["protocolVersion"] != "2025-11-25" {
+		t.Fatalf("expected protocolVersion 2025-11-25, got %v", result["protocolVersion"])
 	}
 	serverInfo, ok := result["serverInfo"].(map[string]any)
 	if !ok {
@@ -97,7 +152,7 @@ func TestJSONRPC_InitializeHandshake(t *testing.T) {
 	}
 }
 
-func TestJSONRPC_InitializeMinimalParams(t *testing.T) {
+func TestJSONRPC_InitializeRequiresLifecycleFields(t *testing.T) {
 	ts, _, cleanup := newTestServer(t, "full")
 	defer cleanup()
 
@@ -108,12 +163,75 @@ func TestJSONRPC_InitializeMinimalParams(t *testing.T) {
 		"method":  "initialize",
 	})
 
-	if out["error"] != nil {
-		t.Fatalf("initialize with no params should succeed, got error: %v", out["error"])
+	errObj, ok := out["error"].(map[string]any)
+	if !ok || errObj["code"] != float64(-32602) {
+		t.Fatalf("initialize without lifecycle fields = %+v, want InvalidParams", out)
 	}
-	result := out["result"].(map[string]any)
-	if result["protocolVersion"] != "2024-11-05" {
-		t.Fatalf("unexpected protocolVersion: %v", result["protocolVersion"])
+}
+
+func TestJSONRPC_InitializeRequiresClientInfoVersion(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	cases := []map[string]any{
+		{
+			"protocolVersion": "2025-11-25",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "Example client"},
+		},
+		{
+			"protocolVersion": "2025-11-25",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "Example client", "version": " "},
+		},
+	}
+	for _, params := range cases {
+		_, out := doJSONRPC(t, client, ts.URL, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"method":  "initialize",
+			"params":  params,
+		})
+		errObj, ok := out["error"].(map[string]any)
+		if !ok || errObj["code"] != float64(-32602) {
+			t.Fatalf("initialize missing/blank version = %+v, want InvalidParams", out)
+		}
+	}
+}
+
+func TestJSONRPC_PingReturnsEmptyResult(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	ids := []any{"ping-1", 7, 0}
+	for _, id := range ids {
+		resp, out := doJSONRPC(t, client, ts.URL, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  "ping",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("ping id=%v status=%d, want 200", id, resp.StatusCode)
+		}
+		if out["error"] != nil {
+			t.Fatalf("ping id=%v unexpected error: %v", id, out["error"])
+		}
+		result, ok := out["result"].(map[string]any)
+		if !ok || len(result) != 0 {
+			t.Fatalf("ping id=%v result=%v, want {}", id, out["result"])
+		}
+		switch want := id.(type) {
+		case string:
+			if out["id"] != want {
+				t.Fatalf("ping id=%v echoed %v", id, out["id"])
+			}
+		case int:
+			if out["id"] != float64(want) {
+				t.Fatalf("ping id=%v echoed %v", id, out["id"])
+			}
+		}
 	}
 }
 
@@ -127,8 +245,8 @@ func TestJSONRPC_InitializedNotification(t *testing.T) {
 		"method":  "notifications/initialized",
 	})
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204 for notification, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for notification, got %d", resp.StatusCode)
 	}
 	if out != nil {
 		t.Fatalf("expected no body for notification, got %v", out)
@@ -145,8 +263,8 @@ func TestJSONRPC_InitializedAltName(t *testing.T) {
 		"method":  "initialized",
 	})
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204 for 'initialized' notification, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for 'initialized' notification, got %d", resp.StatusCode)
 	}
 }
 
@@ -191,7 +309,7 @@ func TestJSONRPC_UnknownMethodReturnsError(t *testing.T) {
 }
 
 func TestJSONRPC_InvalidJSONReturnsParseError(t *testing.T) {
-	ts, _, cleanup := newTestServer(t, "full")
+	ts, _, cleanup := newTestServer(t, "anonymous")
 	defer cleanup()
 
 	client := newStatelessClient(ts)
@@ -218,6 +336,114 @@ func TestJSONRPC_InvalidJSONReturnsParseError(t *testing.T) {
 	}
 }
 
+func TestJSONRPC_InvalidParamsTypeReturnsInvalidRequest(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	for _, params := range []any{123, nil} {
+		_, out := doJSONRPC(t, client, ts.URL, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      7,
+			"method":  "tools/list",
+			"params":  params,
+		})
+		errObj, ok := out["error"].(map[string]any)
+		if !ok || errObj["code"] != float64(-32600) {
+			t.Fatalf("params=%v response=%+v, want InvalidRequest", params, out)
+		}
+		if out["result"] != nil {
+			t.Fatalf("params=%v unexpectedly succeeded: %+v", params, out)
+		}
+	}
+}
+
+func TestJSONRPC_NotificationWithInvalidParamsRejected(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	for _, tc := range []struct {
+		name   string
+		method string
+		params any
+	}{
+		{name: "known scalar", method: "notifications/initialized", params: 123},
+		{name: "known null", method: "notifications/initialized", params: nil},
+		{name: "unknown scalar", method: "notifications/example", params: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, out := doJSONRPC(t, client, ts.URL, map[string]any{
+				"jsonrpc": "2.0",
+				"method":  tc.method,
+				"params":  tc.params,
+			})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400", resp.StatusCode)
+			}
+			errObj, ok := out["error"].(map[string]any)
+			if !ok || errObj["code"] != float64(-32600) {
+				t.Fatalf("response=%+v, want InvalidRequest", out)
+			}
+			if id, present := out["id"]; !present || id != nil {
+				t.Fatalf("id=%v present=%v, want explicit null", id, present)
+			}
+		})
+	}
+}
+
+func TestJSONRPC_StructuralErrorPreservesRecoverableID(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	cases := []struct {
+		id   any
+		want any
+	}{
+		{"request-42", "request-42"},
+		{7, float64(7)},
+		{0, float64(0)},
+	}
+	for _, tc := range cases {
+		raw, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      tc.id,
+			"method":  123,
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/mcp/rpc", bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+		session := ensureJSONRPCTestSession(t, client, ts.URL)
+		if session != nil {
+			req.AddCookie(session)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			resp.Body.Close()
+			t.Fatalf("decode: %v", err)
+		}
+		resp.Body.Close()
+		errObj, ok := out["error"].(map[string]any)
+		if !ok || errObj["code"] != float64(-32600) {
+			t.Fatalf("id=%v response=%+v, want InvalidRequest", tc.id, out)
+		}
+		if out["id"] != tc.want {
+			t.Fatalf("id=%v echoed %v, want %v", tc.id, out["id"], tc.want)
+		}
+	}
+}
+
 func TestJSONRPC_MissingVersionReturnsInvalidRequest(t *testing.T) {
 	ts, _, cleanup := newTestServer(t, "full")
 	defer cleanup()
@@ -234,27 +460,21 @@ func TestJSONRPC_MissingVersionReturnsInvalidRequest(t *testing.T) {
 	}
 }
 
-func TestJSONRPC_GetMethodRejected(t *testing.T) {
+func TestJSONRPC_UnauthenticatedGetChallenges(t *testing.T) {
 	ts, _, cleanup := newTestServer(t, "full")
 	defer cleanup()
 
-	client := newStatelessClient(ts)
 	resp, err := http.Get(ts.URL + "/mcp/rpc")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 
-	_ = client // use ts.Client() transport via http.Get on ts.URL
-
-	var out map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode: %v", err)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET status = %d, want 401", resp.StatusCode)
 	}
-
-	errObj := out["error"].(map[string]any)
-	if errObj["code"].(float64) != -32600 {
-		t.Fatalf("expected InvalidRequest code for GET, got %v", errObj["code"])
+	if got := resp.Header.Get("WWW-Authenticate"); got != `Bearer resource_metadata="`+ts.URL+`/.well-known/oauth-protected-resource/mcp/rpc"` {
+		t.Fatalf("WWW-Authenticate = %q", got)
 	}
 }
 
@@ -390,18 +610,18 @@ func TestJSONRPC_ToolsList_TodosCreateSchema(t *testing.T) {
 	var todosCreate map[string]any
 	for _, t2 := range tools {
 		tool := t2.(map[string]any)
-		if tool["name"] == "todos.create" {
+		if tool["name"] == "todos_create" {
 			todosCreate = tool
 			break
 		}
 	}
 	if todosCreate == nil {
-		t.Fatal("todos.create not found in tools/list")
+		t.Fatal("todos_create not found in tools/list")
 	}
 
 	schema := todosCreate["inputSchema"].(map[string]any)
 	if schema["additionalProperties"] != false {
-		t.Fatalf("todos.create root additionalProperties expected false, got %v", schema["additionalProperties"])
+		t.Fatalf("todos_create root additionalProperties expected false, got %v", schema["additionalProperties"])
 	}
 	props := schema["properties"].(map[string]any)
 
@@ -422,7 +642,7 @@ func TestJSONRPC_ToolsList_TodosCreateSchema(t *testing.T) {
 	expectedProps := []string{"projectSlug", "title", "body", "tags", "columnKey", "estimationPoints", "sprintId", "assigneeUserId", "position"}
 	for _, prop := range expectedProps {
 		if props[prop] == nil {
-			t.Fatalf("todos.create schema missing property %q", prop)
+			t.Fatalf("todos_create schema missing property %q", prop)
 		}
 	}
 
@@ -458,18 +678,18 @@ func TestJSONRPC_ToolsList_TodosUpdateSchema(t *testing.T) {
 	var todosUpdate map[string]any
 	for _, t2 := range tools {
 		tool := t2.(map[string]any)
-		if tool["name"] == "todos.update" {
+		if tool["name"] == "todos_update" {
 			todosUpdate = tool
 			break
 		}
 	}
 	if todosUpdate == nil {
-		t.Fatal("todos.update not found in tools/list")
+		t.Fatal("todos_update not found in tools/list")
 	}
 
 	schema := todosUpdate["inputSchema"].(map[string]any)
 	if schema["additionalProperties"] != false {
-		t.Fatalf("todos.update root additionalProperties expected false, got %v", schema["additionalProperties"])
+		t.Fatalf("todos_update root additionalProperties expected false, got %v", schema["additionalProperties"])
 	}
 	props := schema["properties"].(map[string]any)
 
@@ -492,28 +712,80 @@ func TestJSONRPC_ToolsList_TodosUpdateSchema(t *testing.T) {
 	expectedPatchFields := []string{"title", "body", "tags", "estimationPoints", "assigneeUserId", "sprintId"}
 	for _, field := range expectedPatchFields {
 		if patchProps[field] == nil {
-			t.Fatalf("todos.update patch missing field %q", field)
+			t.Fatalf("todos_update patch missing field %q", field)
 		}
 	}
 
 	sprintIDSchema := patchProps["sprintId"].(map[string]any)
 	typ, ok := sprintIDSchema["type"].([]any)
 	if !ok {
-		t.Fatalf("todos.update patch.sprintId type expected []any, got %T %#v", sprintIDSchema["type"], sprintIDSchema["type"])
+		t.Fatalf("todos_update patch.sprintId type expected []any, got %T %#v", sprintIDSchema["type"], sprintIDSchema["type"])
 	}
 	have := map[string]struct{}{}
 	for _, x := range typ {
 		s, ok := x.(string)
 		if !ok {
-			t.Fatalf("todos.update patch.sprintId type union element expected string, got %T", x)
+			t.Fatalf("todos_update patch.sprintId type union element expected string, got %T", x)
 		}
 		have[s] = struct{}{}
 	}
 	if _, ok := have["integer"]; !ok {
-		t.Fatalf("todos.update patch.sprintId expected integer in type union, got %#v", typ)
+		t.Fatalf("todos_update patch.sprintId expected integer in type union, got %#v", typ)
 	}
 	if _, ok := have["null"]; !ok {
-		t.Fatalf("todos.update patch.sprintId expected null in type union, got %#v", typ)
+		t.Fatalf("todos_update patch.sprintId expected null in type union, got %#v", typ)
+	}
+}
+
+func TestJSONRPC_ToolsList_TodosLinkAddSchema(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	_, out := doJSONRPC(t, client, ts.URL, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	})
+
+	result := out["result"].(map[string]any)
+	tools := result["tools"].([]any)
+
+	var todosLinkAdd map[string]any
+	for _, t2 := range tools {
+		tool := t2.(map[string]any)
+		if tool["name"] == "todos_linkAdd" {
+			todosLinkAdd = tool
+			break
+		}
+	}
+	if todosLinkAdd == nil {
+		t.Fatal("todos_linkAdd not found in tools/list")
+	}
+
+	schema := todosLinkAdd["inputSchema"].(map[string]any)
+	props := schema["properties"].(map[string]any)
+
+	linkType, ok := props["linkType"].(map[string]any)
+	if !ok {
+		t.Fatalf("todos_linkAdd schema missing linkType property, got %#v", props["linkType"])
+	}
+	if linkType["type"] != "string" {
+		t.Fatalf("todos_linkAdd linkType type expected string, got %v", linkType["type"])
+	}
+
+	enum, ok := linkType["enum"].([]any)
+	if !ok {
+		t.Fatalf("todos_linkAdd linkType.enum expected array, got %T %#v", linkType["enum"], linkType["enum"])
+	}
+	want := []string{"relates_to", "blocks", "duplicates", "parent"}
+	if len(enum) != len(want) {
+		t.Fatalf("todos_linkAdd linkType.enum expected %v, got %#v", want, enum)
+	}
+	for i, v := range want {
+		if enum[i] != v {
+			t.Fatalf("todos_linkAdd linkType.enum[%d] expected %q, got %q", i, v, enum[i])
+		}
 	}
 }
 
@@ -534,28 +806,28 @@ func TestJSONRPC_ToolsList_ProjectsListSchema(t *testing.T) {
 	var projectsList map[string]any
 	for _, t2 := range tools {
 		tool := t2.(map[string]any)
-		if tool["name"] == "projects.list" {
+		if tool["name"] == "projects_list" {
 			projectsList = tool
 			break
 		}
 	}
 	if projectsList == nil {
-		t.Fatal("projects.list not found in tools/list")
+		t.Fatal("projects_list not found in tools/list")
 	}
 
 	schema := projectsList["inputSchema"].(map[string]any)
 	if schema["type"] != "object" {
-		t.Fatalf("projects.list inputSchema.type expected object, got %v", schema["type"])
+		t.Fatalf("projects_list inputSchema.type expected object, got %v", schema["type"])
 	}
 	if schema["additionalProperties"] != false {
-		t.Fatalf("projects.list additionalProperties expected false, got %v", schema["additionalProperties"])
+		t.Fatalf("projects_list additionalProperties expected false, got %v", schema["additionalProperties"])
 	}
 	props, ok := schema["properties"].(map[string]any)
 	if !ok {
-		t.Fatalf("projects.list expected properties object, got %v", schema["properties"])
+		t.Fatalf("projects_list expected properties object, got %v", schema["properties"])
 	}
 	if len(props) != 0 {
-		t.Fatalf("projects.list expected empty properties, got %v", props)
+		t.Fatalf("projects_list expected empty properties, got %v", props)
 	}
 }
 
@@ -602,7 +874,7 @@ func TestJSONRPC_ToolsCall_HappyPath(t *testing.T) {
 		"id":      42,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "projects.list",
+			"name":      "projects_list",
 			"arguments": map[string]any{},
 		},
 	})
@@ -668,7 +940,7 @@ func TestJSONRPC_ToolsCall_TodosCreate(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name": "todos.create",
+			"name": "todos_create",
 			"arguments": map[string]any{
 				"projectSlug": slug,
 				"title":       "MCP Todo",
@@ -729,6 +1001,12 @@ func TestJSONRPC_ToolsCall_UnknownTool(t *testing.T) {
 	if item["text"] != "tool not found" {
 		t.Fatalf("expected tool not found message, got %v", item["text"])
 	}
+	structured := result["structuredContent"].(map[string]any)
+	if structured["code"] != "NOT_FOUND" ||
+		structured["message"] != "tool not found" ||
+		!reflect.DeepEqual(structured["details"], map[string]any{"tool": "nonexistent.tool"}) {
+		t.Fatalf("unexpected structured tool error: %#v", structured)
+	}
 }
 
 func TestJSONRPC_ToolsCall_MissingName(t *testing.T) {
@@ -786,7 +1064,7 @@ func TestJSONRPC_ToolsCall_MissingRequiredArguments(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "todos.create",
+			"name":      "todos_create",
 			"arguments": map[string]any{"projectSlug": "x"},
 		},
 	})
@@ -802,6 +1080,12 @@ func TestJSONRPC_ToolsCall_MissingRequiredArguments(t *testing.T) {
 	item := content[0].(map[string]any)
 	if item["text"] != "missing required field: title" {
 		t.Fatalf("expected missing required field error, got %v", item["text"])
+	}
+	structured := result["structuredContent"].(map[string]any)
+	if structured["code"] != "VALIDATION_ERROR" ||
+		structured["message"] != "missing required field: title" ||
+		!reflect.DeepEqual(structured["details"], map[string]any{"field": "title"}) {
+		t.Fatalf("unexpected structured required-field error: %#v", structured)
 	}
 }
 
@@ -821,7 +1105,7 @@ func TestJSONRPC_ToolsCall_WithoutInitialize(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "projects.list",
+			"name":      "projects_list",
 			"arguments": map[string]any{},
 		},
 	})
@@ -841,21 +1125,21 @@ func TestJSONRPC_ToolsCall_WithoutID(t *testing.T) {
 	defer cleanup()
 
 	client := newStatelessClient(ts)
-	_, out := doJSONRPC(t, client, ts.URL, map[string]any{
+	resp, out := doJSONRPC(t, client, ts.URL, map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "projects.list",
+			"name":      "projects_list",
 			"arguments": map[string]any{},
 		},
 	})
 
-	errObj, ok := out["error"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected error for tools/call without id, got %v", out)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("tools/call without id status=%d body=%v, want 400", resp.StatusCode, out)
 	}
-	if errObj["code"].(float64) != -32600 {
-		t.Fatalf("expected InvalidRequest code, got %v", errObj["code"])
+	errObj, ok := out["error"].(map[string]any)
+	if !ok || errObj["code"] != float64(-32600) {
+		t.Fatalf("tools/call without id body=%v, want InvalidRequest", out)
 	}
 }
 
@@ -863,33 +1147,10 @@ func TestJSONRPC_ToolsCall_ErrorMapping_AuthRequired(t *testing.T) {
 	ts, _, cleanup := newTestServer(t, "full")
 	defer cleanup()
 
-	client := newStatelessClient(ts)
 	bootstrapUser(t, newCookieClient(t, ts), ts.URL)
-
-	_, out := doJSONRPC(t, client, ts.URL, map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "tools/call",
-		"params": map[string]any{
-			"name":      "projects.list",
-			"arguments": map[string]any{},
-		},
-	})
-
-	if out["error"] != nil {
-		t.Fatalf("expected tool result error, got %v", out["error"])
-	}
-	result := out["result"].(map[string]any)
-	if result["isError"] != true {
-		t.Fatalf("expected isError=true, got %v", result["isError"])
-	}
-	content := result["content"].([]any)
-	item := content[0].(map[string]any)
-	if item["text"] != "Sign-in required for this tool" {
-		t.Fatalf("expected auth error message, got %v", item["text"])
-	}
-	if out["ok"] != nil {
-		t.Fatal("JSON-RPC response must not contain legacy ok field")
+	resp, body := rawJSONRPC(t, newStatelessClient(ts), ts.URL, "")
+	if resp.StatusCode != http.StatusUnauthorized || len(body) != 0 {
+		t.Fatalf("status=%d body=%q, want empty 401", resp.StatusCode, body)
 	}
 }
 
@@ -903,7 +1164,7 @@ func TestJSONRPC_ToolsCall_ErrorMapping_CapabilityUnavailable(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "projects.list",
+			"name":      "projects_list",
 			"arguments": map[string]any{},
 		},
 	})
@@ -917,8 +1178,14 @@ func TestJSONRPC_ToolsCall_ErrorMapping_CapabilityUnavailable(t *testing.T) {
 	}
 	content := result["content"].([]any)
 	item := content[0].(map[string]any)
-	if item["text"] != "projects.list is unavailable in anonymous mode" {
+	if item["text"] != "projects_list is unavailable in anonymous mode" {
 		t.Fatalf("expected capability error message, got %v", item["text"])
+	}
+	structured := result["structuredContent"].(map[string]any)
+	if structured["code"] != "CAPABILITY_UNAVAILABLE" ||
+		structured["message"] != "projects_list is unavailable in anonymous mode" ||
+		!reflect.DeepEqual(structured["details"], map[string]any{}) {
+		t.Fatalf("unexpected structured capability error: %#v", structured)
 	}
 	if out["ok"] != nil {
 		t.Fatal("JSON-RPC response must not contain legacy ok field")
@@ -941,7 +1208,7 @@ func TestJSONRPC_ToolsCall_NoLegacyLeakage(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name":      "projects.list",
+			"name":      "projects_list",
 			"arguments": map[string]any{},
 		},
 	})
@@ -973,7 +1240,7 @@ func TestJSONRPC_ToolsCall_DefaultsEmptyArguments(t *testing.T) {
 		"id":      1,
 		"method":  "tools/call",
 		"params": map[string]any{
-			"name": "projects.list",
+			"name": "projects_list",
 		},
 	})
 
@@ -1015,5 +1282,74 @@ func TestJSONRPC_ResponsePreservesID(t *testing.T) {
 				t.Fatalf("id mismatch: sent %v got %v", id, gotID)
 			}
 		}
+	}
+}
+
+func TestJSONRPC_ToolsList_WorkflowSchemas(t *testing.T) {
+	ts, _, cleanup := newTestServer(t, "full")
+	defer cleanup()
+
+	client := newStatelessClient(ts)
+	_, out := doJSONRPC(t, client, ts.URL, map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	})
+
+	result := out["result"].(map[string]any)
+	tools := result["tools"].([]any)
+
+	byName := make(map[string]map[string]any, len(tools))
+	for _, raw := range tools {
+		tool := raw.(map[string]any)
+		name, _ := tool["name"].(string)
+		byName[name] = tool
+	}
+
+	requiredSet := func(tool map[string]any) map[string]bool {
+		schema := tool["inputSchema"].(map[string]any)
+		req := map[string]bool{}
+		for _, r := range schema["required"].([]any) {
+			req[r.(string)] = true
+		}
+		return req
+	}
+	hasProps := func(tool map[string]any, names ...string) {
+		schema := tool["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		for _, n := range names {
+			if _, ok := props[n]; !ok {
+				t.Fatalf("%v schema missing property %q, got %#v", tool["name"], n, props)
+			}
+		}
+	}
+
+	cases := []struct {
+		name     string
+		required []string
+	}{
+		{"workflow_list", []string{"projectSlug"}},
+		{"workflow_create", []string{"projectSlug", "name"}},
+		{"workflow_update", []string{"projectSlug", "columnKey", "name", "color"}},
+		{"workflow_delete", []string{"projectSlug", "columnKey"}},
+	}
+	for _, c := range cases {
+		tool, ok := byName[c.name]
+		if !ok {
+			t.Fatalf("%s not found in tools/list", c.name)
+		}
+		if tool["description"] == nil || tool["description"] == "" {
+			t.Fatalf("%s missing description", c.name)
+		}
+		req := requiredSet(tool)
+		if len(req) != len(c.required) {
+			t.Fatalf("%s expected required %v, got %#v", c.name, c.required, req)
+		}
+		for _, r := range c.required {
+			if !req[r] {
+				t.Fatalf("%s missing required field %q, got %#v", c.name, r, req)
+			}
+		}
+		hasProps(tool, c.required...)
 	}
 }

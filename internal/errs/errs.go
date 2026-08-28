@@ -8,8 +8,10 @@ import "errors"
 var (
 	ErrValidation                 = errors.New("validation")
 	ErrUnauthorized               = errors.New("unauthorized")
+	ErrForbidden                  = errors.New("forbidden")
 	ErrNotFound                   = errors.New("not found")
 	ErrConflict                   = errors.New("conflict")
 	ErrTooManyAttempts            = errors.New("too many attempts")
 	Err2FAEncryptionNotConfigured = errors.New("2FA encryption not configured")
+	ErrEncryptionNotConfigured    = errors.New("encryption not configured")
 )

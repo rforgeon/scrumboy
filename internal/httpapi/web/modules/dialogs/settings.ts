@@ -4,12 +4,24 @@ import { fetchProjectMembers } from '../members-cache.js';
 import { escapeHTML, showToast, getAppVersion, showConfirmDialog, confirmDelete, isAnonymousBoard, renderUserAvatar, processImageFile, renderAvatarContent, sanitizeHexColor } from '../utils.js';
 import { getStoredTheme, handleThemeChange, THEME_SYSTEM, THEME_DARK, THEME_LIGHT } from '../theme.js';
 import { getStoredWallpaperState, setWallpaperOff, setWallpaperColor, uploadWallpaperImage } from '../wallpaper.js';
+import {
+  CARDS_PER_LANE_ALLOWED,
+  CARDS_PER_LANE_PREFERENCE_KEY,
+  getDefaultCardsPerLane,
+  setDefaultCardsPerLane,
+  invalidateBoard,
+  usePreferenceLimitOnNextBoardRequest,
+} from '../orchestration/board-refresh.js';
+import { clearBoardPrefetchCache } from '../views/board-prefetch-cache.js';
 import { processWallpaperFileForUpload } from '../utils.js';
 import { 
   getSlug, 
   getTag, 
   getSearch,
   getSprintIdFromUrl,
+  getAssigneeFromUrl,
+  getSortFromUrl,
+  getPriorityFromUrl,
   getBoard,
   getProjectId, 
   getProjects, 
@@ -18,7 +30,11 @@ import {
   getTagColors, 
   getUser, 
   getAuthStatusAvailable,
+  getOidcEnabled,
+  getLocalAuthEnabled,
   getPushConfigured,
+  getEmailNotifyAvailable,
+  getPushStatus,
   getBackupImportBtn,
   getBackupData,
   getBackupPreview,
@@ -68,6 +84,12 @@ import {
 import { isPushSubscribed, subscribeToPush, unsubscribeFromPush } from '../core/push.js';
 import { getVoiceFlowEnabledPreference, setVoiceFlowEnabledPreference } from '../core/voiceflow-preferences.js';
 import {
+  getWrapLanesPreference,
+  setWrapLanesPreference,
+  syncOpenBoardWrapLanesClass,
+} from '../core/wrap-lanes-preferences.js';
+import { getEmailNotifyViewState, setEmailNotifyPref, type EmailNotifyCategory } from '../core/email-notify-preferences.js';
+import {
   bindWorkflowTabInteractions,
   clearWorkflowDraftState,
   invalidateWorkflowLaneCountsCache,
@@ -76,11 +98,25 @@ import {
   resetWorkflowDraftToBaseline,
 } from './settings-workflow.js';
 import {
+  bindPriorityTabInteractions,
+  clearPriorityDraftState,
+  invalidatePriorityTierCountsCache,
+  isPriorityDraftDirty,
+  loadPriorityTabContent,
+  resetPriorityDraftToBaseline,
+  syncPriorityLocaleState,
+} from './settings-priorities.js';
+import {
   bindTagTabInteractions,
   invalidateTagsCache as invalidateTagSettingsCache,
   loadTagSettingsContent,
+  type TagSettingsScope,
 } from './settings-tags.js';
 import { bindSprintsTabInteractions, refreshSprintDateLabels, renderSprintsTabContent } from './settings-sprints.js';
+import {
+  bindCalendarTabInteractions,
+  loadCalendarTabContent,
+} from './settings-calendar.js';
 import { apiErrorMessageOrRaw, getLocale, hydrateI18n, I18N_LOCALE_CHANGED, t } from '../i18n/index.js';
 import { bindPublicLocaleSelect, renderPublicLocaleSelectHTML, syncPublicLocaleSelect } from '../i18n/locale-select.js';
 
@@ -177,6 +213,19 @@ async function switchSettingsTab(tabName: string): Promise<void> {
   if (tabName === "workflow") {
     invalidateWorkflowLaneCountsCache();
     clearWorkflowDraftState();
+  }
+  if (getSettingsActiveTab() === "priorities" && isPriorityDraftDirty()) {
+    const discard = await showConfirmDialog(
+      t('settings.priorities.unsavedConfirm.message'),
+      t('settings.priorities.unsavedConfirm.title'),
+      t('settings.priorities.unsavedConfirm.confirm')
+    );
+    if (!discard) return;
+    resetPriorityDraftToBaseline();
+  }
+  if (tabName === "priorities") {
+    invalidatePriorityTierCountsCache();
+    clearPriorityDraftState();
   }
   setSettingsActiveTab(tabName);
   await renderSettingsModal();
@@ -418,6 +467,12 @@ function applySettingsLocaleToOpenDialog(): void {
     return;
   }
 
+  if (activeTab === "priorities") {
+    hydrateI18n(tabContentEl);
+    syncPriorityLocaleState(tabContentEl);
+    return;
+  }
+
   if (activeTab === "tag-colors") {
     hydrateI18n(tabContentEl);
     syncTagColorsLocaleState(tabContentEl);
@@ -427,6 +482,11 @@ function applySettingsLocaleToOpenDialog(): void {
   if (activeTab === "sprints") {
     hydrateI18n(tabContentEl);
     refreshSprintDateLabels(tabContentEl);
+    return;
+  }
+
+  if (activeTab === "calendar") {
+    hydrateI18n(tabContentEl);
     return;
   }
 
@@ -516,6 +576,36 @@ function bindDialogLocale(dialog: HTMLDialogElement, sync?: () => void): () => v
   dialog.addEventListener("cancel", handleNativeCleanup);
   dialog.addEventListener("close", handleNativeCleanup);
   return release;
+}
+
+/**
+ * Wire uniform, orphan-free teardown for a dynamically-created dialog.
+ *
+ * Returns an idempotent `close()` that releases the locale listener, runs any
+ * caller cleanup, and removes the node from the DOM. Native dismiss paths
+ * (Escape / light-dismiss `cancel`, and the `close` event) are routed through
+ * the same `close()` so the node can never be left detached-but-present, which
+ * would otherwise duplicate element IDs and misbind handlers on reopen.
+ */
+function attachDialogClose(
+  dialog: HTMLDialogElement,
+  releaseLocale: () => void,
+  extraCleanup?: () => void
+): () => void {
+  let removed = false;
+  const close = () => {
+    if (removed) return;
+    removed = true;
+    extraCleanup?.();
+    releaseLocale();
+    dialog.remove();
+  };
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    close();
+  });
+  dialog.addEventListener("close", close);
+  return close;
 }
 
 /**
@@ -1223,6 +1313,7 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
     console.error("Settings dialog content element not found");
     return;
   }
+  const dialogWasOpen = !!(settingsDialog as HTMLDialogElement | null)?.open;
 
   // Full mode only: show Profile tab (auth status endpoint exists only in full mode).
   const showProfileTab = !!getAuthStatusAvailable();
@@ -1230,23 +1321,29 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   // Show Users tab only if user has admin or owner role
   const currentUser = getUser();
   const showUsersTab = showProfileTab && (currentUser?.systemRole === "owner" || currentUser?.systemRole === "admin");
+  const canSeePushConfigurationDetails = currentUser?.systemRole === "owner" || currentUser?.systemRole === "admin";
   
   // In board view we have a slug and can use capability routes.
-  // In projects listing view (full mode), show all tags from all projects the user has access to.
+  // In projects listing view (full mode), show the user's cross-project personal library.
+  // Tag mutation scope is explicit (mine/board) and must not be inferred from
+  // settingsProjectId, which is also used for unrelated chart data.
   let tagsURL: string | null = null;
+  let tagSettingsScope: TagSettingsScope | null = null;
   let realBurndownURL: string | null = null;
   let hasProjectAccess = false;
   
   if (getSlug()) {
     // Board view: show tags from this specific board
     tagsURL = `/api/board/${getSlug()}/tags`;
+    tagSettingsScope = 'board';
     realBurndownURL = `/api/board/${getSlug()}/burndown`;
     setSettingsProjectId(null);
     hasProjectAccess = true;
   } else {
-    // Projects listing view: show all tags from all projects the user has access to
+    // Projects listing view: show all tags from the personal library
     if (getUser()) {
       tagsURL = `/api/tags/mine`;
+      tagSettingsScope = 'mine';
       hasProjectAccess = true;
     }
     // For charts, still need a project ID (use first available project)
@@ -1278,10 +1375,13 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   const myMember = currentUser ? boardMembers.find((m: any) => m.userId === currentUser.id) : null;
   const showSprintsTab = !!slug && hasProjectAccess && myMember?.role === "maintainer";
   const showWorkflowTab = !!slug && hasProjectAccess && myMember?.role === "maintainer";
+  const showPrioritiesTab = !!slug && hasProjectAccess && myMember?.role === "maintainer";
 
   // Charts tab only applies in durable project board view (not Dashboard/Projects/Temporary Boards, not anonymous mode, not temporary boards)
   const board = getBoard();
   const isTemporaryBoard = !!(board?.project?.expiresAt);
+  const showCalendarTab = !!slug && hasProjectAccess && !!currentUser && !!myMember && !isTemporaryBoard;
+  const sprintsEnabled = board?.project?.sprintsEnabled !== false;
   const showChartsTab =
     !!slug &&
     hasProjectAccess &&
@@ -1302,6 +1402,10 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   } else if (!showChartsTab && getSettingsActiveTab() === "charts") {
     setSettingsActiveTab(hasProjectAccess ? "tag-colors" : "customization");
   } else if (!showWorkflowTab && getSettingsActiveTab() === "workflow") {
+	setSettingsActiveTab(hasProjectAccess ? "tag-colors" : "customization");
+  } else if (!showPrioritiesTab && getSettingsActiveTab() === "priorities") {
+	setSettingsActiveTab(hasProjectAccess ? "tag-colors" : "customization");
+  } else if (!showCalendarTab && getSettingsActiveTab() === "calendar") {
     setSettingsActiveTab(hasProjectAccess ? "tag-colors" : "customization");
   } else if (getSettingsActiveTab() === "voiceflow") {
     setSettingsActiveTab("customization");
@@ -1330,20 +1434,21 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   let tagsHTML = "";
   let realBurndownData: any[] = [];
   
-  if (hasProjectAccess) {
+  if (hasProjectAccess && tagSettingsScope) {
     try {
-      tagsHTML = await loadTagSettingsContent(tagsURL!);
+      tagsHTML = await loadTagSettingsContent(tagsURL!, tagSettingsScope);
 
       // Lazy-load chart data and sprints only when Charts tab is active
       const activeTab = getSettingsActiveTab();
       if (activeTab === "charts") {
         // Fetch sprints for burndown navigation
         const slug = getSlug();
-        if (!slug) {
+        if (!slug || !sprintsEnabled) {
           cachedSprintsForCharts = null;
           cachedSprintsForChartsSlug = null;
+          burndownSprintIndex = 0;
         }
-        if (slug && (cachedSprintsForCharts === null || cachedSprintsForChartsSlug !== slug)) {
+        if (slug && sprintsEnabled && (cachedSprintsForCharts === null || cachedSprintsForChartsSlug !== slug)) {
           try {
             const sprintsRes = await apiFetch<{ sprints?: { id: number; name: string; plannedStartAt: number; plannedEndAt: number; state?: string }[] } | null>(`/api/board/${slug}/sprints`);
             const rawSprints = normalizeSprints(sprintsRes);
@@ -1358,7 +1463,7 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
           }
         }
         // When a sprint is selected in board view, use sprint-scoped burndown endpoint
-        const sprints = slug ? (cachedSprintsForCharts ?? []) : [];
+        const sprints = slug && sprintsEnabled ? (cachedSprintsForCharts ?? []) : [];
         const burndownSprintIndexClamped = sprints.length > 0 ? Math.min(burndownSprintIndex, sprints.length - 1) : 0;
         const currentSprintForFetch = sprints.length > 0 ? sprints[burndownSprintIndexClamped] : null;
         const effectiveBurndownURL =
@@ -1405,8 +1510,34 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   syncSettingsDialogVersionText();
 
   const profileHTML = (() => {
-    if (!showProfileTab) return "";
+    if (!showProfileTab || getSettingsActiveTab() !== "profile") return "";
     const u = getUser();
+	const authenticationKey = u?.hasLocalPassword && u?.oidcLinked
+	  ? "settings.profile.authentication.dual"
+	  : u?.hasLocalPassword
+	    ? "settings.profile.authentication.local"
+	    : u?.oidcLinked
+	      ? "settings.profile.authentication.sso"
+	      : "settings.profile.authentication.none";
+	const effectiveLocal = !!u?.hasLocalPassword && getLocalAuthEnabled();
+	const effectiveSSO = !!u?.oidcLinked && getOidcEnabled();
+	const ownerWarning = u?.systemRole === "owner" && !effectiveLocal && !effectiveSSO
+	  ? `<div class="settings-section__description" role="alert" data-i18n-text="settings.profile.authentication.warning.noEffectiveOwner">This owner account has no effective sign-in method under the current authentication configuration. The current session may be temporary; host recovery may be required.</div>`
+	  : u?.systemRole === "owner" && !effectiveLocal && effectiveSSO && !getLocalAuthEnabled()
+	    ? `<div class="settings-section__description" role="alert" data-i18n-text="settings.profile.authentication.warning.localDisabledOwner">This owner relies on SSO while local authentication is disabled. If SSO becomes unavailable, recovery requires host access, recover-owner, and re-enabling local authentication.</div>`
+	    : u?.systemRole === "owner" && !effectiveLocal && effectiveSSO
+	      ? `<div class="settings-section__description" role="alert" data-i18n-text="settings.profile.authentication.warning.providerOnly">This owner relies on the external SSO provider. Set a local recovery password to prepare for an outage.</div>`
+	    : "";
+	const connectSSOAction = u && getOidcEnabled() && !u.oidcLinked
+	  ? u.hasLocalPassword
+	    ? `<button class="btn" id="connectSSOBtn" data-i18n-text="settings.profile.authentication.connectSSO">Connect SSO</button>`
+	    : `<div class="muted"><strong data-i18n-text="settings.profile.authentication.connectSSO">Connect SSO</strong>: <span data-i18n-text="settings.profile.authentication.connectRequiresLocal">Set or recover a Scrumboy password before connecting the current SSO provider.</span></div>`
+	  : "";
+	const methodActions = u ? `
+	  <div style="margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px;">
+	    ${u.oidcLinked && !u.hasLocalPassword ? `<button class="btn" id="setScrumboyPasswordBtn" data-i18n-text="settings.profile.authentication.setPassword">Set Scrumboy password</button>` : ""}
+	    ${connectSSOAction}
+	  </div>` : "";
     const twoFactorSection = u ? (u.twoFactorEnabled
       ? `
         <div class="settings-section" style="margin-top: 24px;">
@@ -1442,13 +1573,17 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
             <div class="settings-kv__row"><div class="muted" data-i18n-text="settings.profile.fields.email">Email</div><div>${escapeHTML(u.email || "")}</div></div>
             <div class="settings-kv__row"><div class="muted" data-i18n-text="settings.profile.fields.userId">User ID</div><div>${u.id != null ? escapeHTML(String(u.id)) : ""}</div></div>
             <div class="settings-kv__row"><div class="muted" data-i18n-text="settings.profile.fields.systemRole">System Role</div><div>${u.systemRole ? escapeHTML(u.systemRole.charAt(0).toUpperCase() + u.systemRole.slice(1)) : "User"}</div></div>
-            <div class="settings-kv__row"><div class="muted" data-i18n-text="settings.profile.fields.authentication">Authentication</div><div data-i18n-text="settings.profile.authenticated">Authenticated</div></div>
+			<div class="settings-kv__row"><div class="muted" data-i18n-text="settings.profile.fields.authentication">Authentication</div><div data-i18n-text="${authenticationKey}">${escapeHTML(t(authenticationKey))}</div></div>
           </div>
+		  ${ownerWarning}
+		  ${!getLocalAuthEnabled() && u.hasLocalPassword ? `<div class="settings-section__description muted" data-i18n-text="settings.profile.authentication.localDisabled">A local password is stored, but local login is disabled by the operator.</div>` : ""}
+		  ${methodActions}
           <div style="margin-top: 16px; display: flex; gap: 8px;">
             <button class="btn btn--danger" id="logoutBtn" data-i18n-text="settings.profile.logout">Log out</button>
             ${u.isBootstrap ? `<button class="btn" id="createUserBtn" data-i18n-text="settings.profile.createUser">Create User</button>` : ""}
           </div>
           ${twoFactorSection}
+		  <div class="settings-section__description muted" style="margin-top: 12px;" data-i18n-text="settings.profile.twoFactor.responsibility">Scrumboy 2FA protects local-password sign-in and sensitive authentication-method changes. MFA for normal SSO sign-in is controlled by the configured identity provider.</div>
         ` : `
           <div class="muted" data-i18n-text="settings.profile.notSignedIn">Not signed in.</div>
         `}
@@ -1468,10 +1603,12 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       </div>`;
   }).join("");
 
+  const hasUser = currentUser != null;
   const desktopNotifyStatusKind = getDesktopNotificationStatusKind();
   const desktopNotifyGranted = desktopNotifyStatusKind === "granted";
 
   const pushVapidServerReady = showProfileTab && getPushConfigured();
+  const pushStatus = getPushStatus();
   const activeSettingsTab = getSettingsActiveTab();
 
   const showWallpaperSettings = getAuthStatusAvailable();
@@ -1526,16 +1663,68 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
     `
     : "";
 
-  const pushPwaDisabledNoticeKey = !pushVapidServerReady
-    ? showProfileTab
-      ? "settings.customization.push.vapidNotice"
-      : "settings.customization.push.anonymousNotice"
-    : "";
-  const pushPwaDisabledNoticeText = !pushVapidServerReady
-    ? showProfileTab
-      ? "Web Push needs VAPID keys on the server (SCRUMBOY_VAPID_PUBLIC_KEY and SCRUMBOY_VAPID_PRIVATE_KEY; see docs)."
-      : "Web Push is not available in anonymous mode."
-    : "";
+  const cardsPerLaneSectionHTML = hasUser ? `
+      <div class="settings-section">
+        <div class="settings-section__title" data-i18n-text="settings.customization.cardsPerLane.title">Cards per lane</div>
+        <div class="settings-section__description muted" data-i18n-text="settings.customization.cardsPerLane.description">Number of cards shown by default in each lane before "Load more" is needed.</div>
+        <label class="row" style="align-items:center;gap:10px;margin-top:10px;">
+          <select id="cardsPerLaneSelect" style="width:80px;">
+            ${CARDS_PER_LANE_ALLOWED.map((n) => `<option value="${n}"${getDefaultCardsPerLane() === n ? " selected" : ""}>${n}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+    ` : "";
+
+  const wrapLanesSectionHTML = `
+      <div class="settings-section">
+        <div class="settings-section__title" data-i18n-text="settings.customization.wrapLanes.title">Wrap lanes into rows</div>
+        <div class="settings-section__description muted" data-i18n-text="settings.customization.wrapLanes.description">On wide screens, boards with more than five lanes split into two equal rows; a leftover odd lane sits alone on the next row.</div>
+        <label class="row" style="align-items:center;gap:8px;margin-top:10px;cursor:pointer;">
+          <input type="checkbox" id="wrapLanesToggle" ${getWrapLanesPreference() ? "checked" : ""} />
+          <span data-i18n-text="settings.customization.wrapLanes.toggleLabel">Wrap lanes into rows</span>
+        </label>
+      </div>
+    `;
+
+  let pushPwaDisabledNoticeKey = "";
+  let pushPwaDisabledNoticeText = "";
+  if (!pushVapidServerReady) {
+    if (!showProfileTab) {
+      pushPwaDisabledNoticeKey = "settings.customization.push.anonymousNotice";
+      pushPwaDisabledNoticeText = "Web Push is not available in anonymous mode.";
+    } else if (!pushStatus || pushStatus.state === "not_configured") {
+      pushPwaDisabledNoticeKey = "settings.customization.push.vapidNotice";
+      pushPwaDisabledNoticeText = "Web Push needs VAPID keys on the server (SCRUMBOY_VAPID_PUBLIC_KEY and SCRUMBOY_VAPID_PRIVATE_KEY; see docs).";
+    } else if (!canSeePushConfigurationDetails) {
+      pushPwaDisabledNoticeKey = "settings.customization.push.unavailableNotice";
+      pushPwaDisabledNoticeText = "Web Push is currently unavailable.";
+    } else {
+      const adminNoticeByReason: Record<string, { key: string; text: string }> = {
+        invalid_subscriber: {
+          key: "settings.customization.push.adminWarning.invalidSubscriber",
+          text: "Web Push is disabled because SCRUMBOY_VAPID_SUBSCRIBER is invalid.",
+        },
+        invalid_vapid_public_key: {
+          key: "settings.customization.push.adminWarning.invalidPublicKey",
+          text: "Web Push is disabled because SCRUMBOY_VAPID_PUBLIC_KEY is invalid.",
+        },
+        invalid_vapid_private_key: {
+          key: "settings.customization.push.adminWarning.invalidPrivateKey",
+          text: "Web Push is disabled because SCRUMBOY_VAPID_PRIVATE_KEY is invalid.",
+        },
+        initialization_failed: {
+          key: "settings.customization.push.adminWarning.initializationFailed",
+          text: "Web Push is disabled because initialization failed. Check the server logs.",
+        },
+      };
+      const notice = (pushStatus.reason && adminNoticeByReason[pushStatus.reason]) || {
+        key: "settings.customization.push.adminWarning.unknown",
+        text: "Web Push is disabled because of a server configuration error. Check the server logs.",
+      };
+      pushPwaDisabledNoticeKey = notice.key;
+      pushPwaDisabledNoticeText = notice.text;
+    }
+  }
 
   const languageSectionHTML = `
       <div class="settings-section">
@@ -1544,6 +1733,39 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
         ${renderPublicLocaleSelectHTML({ id: "settingsLocaleSelect", style: "margin-top: 10px; min-width: 180px;" })}
       </div>
     `;
+
+  const emailNotifyAvailable = showProfileTab && getEmailNotifyAvailable();
+  const emailNotifyState = showProfileTab ? getEmailNotifyViewState() : null;
+  const emailNotifyPref = emailNotifyState?.value ?? null;
+  const emailNotifyReady = emailNotifyState?.status === "ready";
+  const emailNotifyInteractive = emailNotifyAvailable && emailNotifyReady;
+  const emailCategoryRows: Array<{ key: EmailNotifyCategory; labelKey: string; label: string }> = [
+    { key: "assigned", labelKey: "settings.customization.emailNotify.category.assigned", label: "When a card is assigned to me" },
+    { key: "createdByMe", labelKey: "settings.customization.emailNotify.category.createdByMe", label: "When a card I opened is updated or moved" },
+    { key: "cardActivity", labelKey: "settings.customization.emailNotify.category.cardActivity", label: "Card created, moved, or deleted" },
+    { key: "sprintActivity", labelKey: "settings.customization.emailNotify.category.sprintActivity", label: "Sprint activity" },
+    { key: "projectActivity", labelKey: "settings.customization.emailNotify.category.projectActivity", label: "Project, workflow, or tag changes" },
+    { key: "addedToProject", labelKey: "settings.customization.emailNotify.category.addedToProject", label: "When I'm added to a project" },
+  ];
+  const emailNotifySectionHTML = showProfileTab ? `
+      <div class="settings-section settings-section--email-notify${!emailNotifyAvailable ? " settings-section--email-notify-disabled" : ""}">
+        <div class="settings-section__title" data-i18n-text="settings.customization.emailNotify.title">Email notifications</div>
+        <div class="settings-section__description muted" data-i18n-text="settings.customization.emailNotify.description">Get emailed about activity on your boards. Off by default.</div>
+        ${!emailNotifyAvailable ? `<p class="muted" style="margin:8px 0;font-size:13px;" data-i18n-text="settings.customization.emailNotify.unavailableNotice">Email notifications require SMTP to be configured on the server (see docs).</p>` : ""}
+        ${emailNotifyAvailable && emailNotifyState?.status === "error" ? `<p class="muted" style="margin:8px 0;font-size:13px;" data-i18n-text="settings.customization.emailNotify.loadFailed">Could not load email notification settings. Reload the page to try again.</p>` : ""}
+        <label class="row" style="align-items:center;gap:8px;margin-top:10px;cursor:pointer;">
+          <input type="checkbox" id="emailNotifyEnabledToggle" ${!emailNotifyInteractive ? "disabled" : ""} ${emailNotifyPref?.enabled ? "checked" : ""} />
+          <span data-i18n-text="settings.customization.emailNotify.toggleLabel">Email notifications on</span>
+        </label>
+        <div class="email-notify-categories" style="margin-top:10px;display:flex;flex-direction:column;gap:6px;">
+          ${emailCategoryRows.map((row) => `
+          <label class="row" style="align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" class="email-notify-category-toggle" data-category="${row.key}" ${(!emailNotifyInteractive || !emailNotifyPref?.enabled) ? "disabled" : ""} ${emailNotifyPref?.[row.key] ? "checked" : ""} />
+            <span data-i18n-text="${row.labelKey}">${escapeHTML(row.label)}</span>
+          </label>`).join("")}
+        </div>
+      </div>
+    ` : "";
 
   const customizationHTML = activeSettingsTab === "customization" ? `
     <div id="settingsCustomizationContent">
@@ -1567,23 +1789,28 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
         </div>
       </div>
       ${wallpaperSectionHTML}
+      ${cardsPerLaneSectionHTML}
+      ${wrapLanesSectionHTML}
       ${getAuthStatusAvailable() ? renderVoiceFlowCustomizationHTML() : ""}
+      ${hasUser ? `
       <div class="settings-section">
         <div class="settings-section__title" data-i18n-text="settings.customization.notifications.title">Desktop notifications</div>
         <div class="settings-section__description muted" data-i18n-text="settings.customization.notifications.description">OS-level alerts when someone assigns you a todo (works when this tab is in the background).</div>
         <p class="muted" id="desktopNotifyStatus" style="margin: 8px 0;" data-i18n-text="${getDesktopNotificationStatusMessageKey(desktopNotifyStatusKind)}">${escapeHTML(getDesktopNotificationStatusDescription())}</p>
         <button type="button" class="btn" id="desktopNotifyEnableBtn" ${desktopNotifyGranted ? "disabled" : ""} data-i18n-text="${getDesktopNotificationButtonMessageKey(desktopNotifyStatusKind)}">${desktopNotifyGranted ? "Notifications enabled" : "Enable notifications"}</button>
       </div>
-      ${pushPwaDisabledNoticeKey ? `<p class="settings-push-vapid-notice" role="status" data-i18n-text="${pushPwaDisabledNoticeKey}">${escapeHTML(pushPwaDisabledNoticeText)}</p>` : ""}
       <div class="settings-section settings-section--push-pwa${!pushVapidServerReady ? " settings-section--push-pwa-disabled" : ""}">
         <div class="settings-section__title" data-i18n-text="settings.customization.push.title">Background notifications (PWA)</div>
         <div class="settings-section__description muted" data-i18n-text="settings.customization.push.description">Alerts when someone assigns you a todo while this app is in the background or closed (best on an installed PWA). Requires VAPID keys on the server. When configured, sign-in triggers an automatic subscribe attempt (the browser may ask for permission). Use the toggle to turn Web Push off or back on for this browser only.</div>
+        ${pushPwaDisabledNoticeKey ? `<p class="settings-push-vapid-notice" role="status" data-i18n-text="${pushPwaDisabledNoticeKey}">${escapeHTML(pushPwaDisabledNoticeText)}</p>` : ""}
         <label class="row" style="align-items:center;gap:8px;margin-top:10px;cursor:pointer;">
           <input type="checkbox" id="pushNotifyToggle" ${!pushVapidServerReady ? "disabled" : ""} />
           <span data-i18n-text="settings.customization.push.toggleLabel">Web Push on this device</span>
         </label>
         <p class="muted" id="pushNotifyHint" style="margin:8px 0 0 0;font-size:13px;"></p>
       </div>
+      ` : ""}
+      ${emailNotifySectionHTML}
       <div class="settings-section settings-section--keybindings">
         <div class="settings-section__title" data-i18n-text="settings.customization.keybindings.title">Keybindings</div>
         <div class="settings-section__description muted" data-i18n-text="settings.customization.keybindings.description">Click a key to record a new shortcut. Press Esc to cancel while listening.</div>
@@ -1650,9 +1877,17 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
   if (showSprintsTab && getSettingsActiveTab() === "sprints") {
     sprintsHTML = await renderSprintsTabContent();
   }
+  let calendarHTML = "";
+  if (showCalendarTab && getSettingsActiveTab() === "calendar") {
+    calendarHTML = await loadCalendarTabContent({ canManageCalendar: myMember?.role === "maintainer" });
+  }
   let workflowHTML = "";
   if (showWorkflowTab && getSettingsActiveTab() === "workflow" && slug) {
     workflowHTML = loadWorkflowTabContent({ slug, rerender: () => renderSettingsModal() });
+  }
+  let prioritiesHTML = "";
+  if (showPrioritiesTab && getSettingsActiveTab() === "priorities" && slug) {
+    prioritiesHTML = loadPriorityTabContent({ slug, rerender: () => renderSettingsModal() });
   }
 
   destroyBurndownChart();
@@ -1662,15 +1897,20 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       ${showUsersTab ? `<button class="settings-tab ${activeSettingsTab === "users" ? "settings-tab--active" : ""}" data-tab="users" data-i18n-text="settings.tabs.users">Users</button>` : ``}
       ${showSprintsTab ? `<button class="settings-tab ${activeSettingsTab === "sprints" ? "settings-tab--active" : ""}" data-tab="sprints" data-i18n-text="settings.tabs.sprints">Sprints</button>` : ``}
       ${showWorkflowTab ? `<button class="settings-tab ${activeSettingsTab === "workflow" ? "settings-tab--active" : ""}" data-tab="workflow" data-i18n-text="settings.tabs.workflow">Workflow</button>` : ``}
+      ${showPrioritiesTab ? `<button class="settings-tab ${activeSettingsTab === "priorities" ? "settings-tab--active" : ""}" data-tab="priorities" data-i18n-text="settings.tabs.priorities">Priorities</button>` : ``}
+      ${showCalendarTab ? `<button class="settings-tab ${activeSettingsTab === "calendar" ? "settings-tab--active" : ""}" data-tab="calendar" data-i18n-text="settings.tabs.calendar">Agenda</button>` : ``}
       <button class="settings-tab ${activeSettingsTab === "customization" ? "settings-tab--active" : ""}" data-tab="customization" data-i18n-text="settings.tabs.customization">Customization</button>
       <button class="settings-tab ${activeSettingsTab === "tag-colors" ? "settings-tab--active" : ""}" data-tab="tag-colors" data-i18n-text="settings.tabs.tagColors">Tag Colors</button>
       ${showChartsTab ? `<button class="settings-tab ${activeSettingsTab === "charts" ? "settings-tab--active" : ""}" data-tab="charts" data-i18n-text="settings.tabs.charts">Charts</button>` : ``}
       <button class="settings-tab ${activeSettingsTab === "backup" ? "settings-tab--active" : ""}" data-tab="backup" data-i18n-text="settings.tabs.backup">Backup</button>
     </div>
     <div class="settings-tab-content" id="settingsTabContent">
-      ${activeSettingsTab === "profile" ? profileHTML : activeSettingsTab === "users" ? usersHTML : activeSettingsTab === "sprints" ? sprintsHTML : activeSettingsTab === "workflow" ? workflowHTML : activeSettingsTab === "customization" ? customizationHTML : activeSettingsTab === "tag-colors" ? tagColorsContent : activeSettingsTab === "charts" ? chartsContent : activeSettingsTab === "backup" ? renderBackupTabHTML() : ""}
+      ${activeSettingsTab === "profile" ? profileHTML : activeSettingsTab === "users" ? usersHTML : activeSettingsTab === "sprints" ? sprintsHTML : activeSettingsTab === "workflow" ? workflowHTML : activeSettingsTab === "priorities" ? prioritiesHTML : activeSettingsTab === "calendar" ? calendarHTML : activeSettingsTab === "customization" ? customizationHTML : activeSettingsTab === "tag-colors" ? tagColorsContent : activeSettingsTab === "charts" ? chartsContent : activeSettingsTab === "backup" ? renderBackupTabHTML() : ""}
     </div>
   `;
+  if (!dialogWasOpen) {
+    (contentEl as HTMLElement).scrollTop = 0;
+  }
 
   if (getLocale() !== "en") {
     applySettingsLocaleToOpenDialog();
@@ -1760,6 +2000,20 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       rerender: () => renderSettingsModal(),
     });
   }
+  if (getSettingsActiveTab() === "priorities") {
+    bindPriorityTabInteractions({
+      signal,
+      settingsDialog: settingsDlg,
+      closeSettingsBtn,
+      rerender: () => renderSettingsModal(),
+    });
+  }
+  if (getSettingsActiveTab() === "calendar") {
+    bindCalendarTabInteractions({
+      signal,
+      rerender: () => renderSettingsModal(),
+    });
+  }
 
   // Setup logout button: use form POST so browser processes Set-Cookie from document response
   // (fetch/XHR responses don't always clear cookies reliably across browsers)
@@ -1841,6 +2095,10 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       showCreateUserDialog();
     }, { signal });
   }
+	const setPasswordBtn = document.getElementById("setScrumboyPasswordBtn");
+	if (setPasswordBtn) setPasswordBtn.addEventListener("click", () => void beginSetScrumboyPassword(), { signal });
+	const connectSSOBtn = document.getElementById("connectSSOBtn");
+	if (connectSSOBtn) connectSSOBtn.addEventListener("click", () => showConnectSSODialog(), { signal });
 
   // Setup 2FA buttons
   const enable2FABtn = document.getElementById("enable2FABtn");
@@ -1935,6 +2193,81 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
         showPasswordResetDialog(userId);
       }, { signal });
     });
+
+    // Default board: enable toggle. Turning it on just reveals the picker; a
+    // project is only saved once one is selected. Turning it off clears the
+    // org setting via DELETE (only when something was actually saved).
+    const defaultBoardToggle = document.getElementById("defaultBoardEnabledToggle") as HTMLInputElement | null;
+    if (defaultBoardToggle) {
+      defaultBoardToggle.addEventListener("change", async () => {
+        const selectRow = document.getElementById("defaultBoardSelectRow");
+        if (defaultBoardToggle.checked) {
+          if (selectRow) selectRow.hidden = false;
+          return;
+        }
+        if (selectRow) selectRow.hidden = true;
+        const wasCustomized = defaultBoardToggle.getAttribute("data-customized") === "true";
+        if (!wasCustomized) return;
+        try {
+          await apiFetch("/api/admin/settings/default-board", { method: "DELETE" });
+          showToast(t("settings.users.defaultBoard.toast.cleared"));
+        } catch (err: any) {
+          showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.users.defaultBoard.toast.saveFailed" }));
+        }
+        await renderSettingsModal();
+      }, { signal });
+    }
+
+    // Default board: project picker and role picker. Saving a project
+    // selection enables the org setting; the role picker is only meaningful
+    // once a project is chosen, so it reads the currently selected project
+    // rather than requiring the admin to re-pick it.
+    const defaultBoardSelect = document.getElementById("defaultBoardProjectSelect") as HTMLSelectElement | null;
+    const defaultBoardRoleSelect = document.getElementById("defaultBoardRoleSelect") as HTMLSelectElement | null;
+
+    let defaultBoardSaving = false;
+    const syncDefaultBoardRoleEnabled = () => {
+      if (!defaultBoardRoleSelect || !defaultBoardSelect) return;
+      const projectId = Number(defaultBoardSelect.value);
+      const hasProject = !!defaultBoardSelect.value && Number.isFinite(projectId) && projectId > 0;
+      defaultBoardRoleSelect.disabled = defaultBoardSaving || !hasProject;
+    };
+    const saveDefaultBoard = async () => {
+      if (defaultBoardSaving) return;
+      const projectId = Number(defaultBoardSelect?.value);
+      if (!defaultBoardSelect?.value || !Number.isFinite(projectId) || projectId <= 0) {
+        syncDefaultBoardRoleEnabled();
+        return;
+      }
+      const role = defaultBoardRoleSelect?.value || "viewer";
+
+      defaultBoardSaving = true;
+      if (defaultBoardSelect) defaultBoardSelect.disabled = true;
+      if (defaultBoardRoleSelect) defaultBoardRoleSelect.disabled = true;
+      try {
+        await apiFetch("/api/admin/settings/default-board", {
+          method: "PUT",
+          body: JSON.stringify({ projectId, role }),
+        });
+        showToast(t("settings.users.defaultBoard.toast.saved"));
+      } catch (err: any) {
+        showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.users.defaultBoard.toast.saveFailed" }));
+      } finally {
+        defaultBoardSaving = false;
+      }
+      await renderSettingsModal();
+    };
+
+    if (defaultBoardSelect) {
+      defaultBoardSelect.addEventListener("change", async () => {
+        syncDefaultBoardRoleEnabled();
+        await saveDefaultBoard();
+      }, { signal });
+      syncDefaultBoardRoleEnabled();
+    }
+    if (defaultBoardRoleSelect) {
+      defaultBoardRoleSelect.addEventListener("change", saveDefaultBoard, { signal });
+    }
   }
 
   // Setup sprints tab (create, activate, close)
@@ -1952,6 +2285,61 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       handleThemeChange((e.target as HTMLInputElement).value);
     }, { signal });
   });
+
+  // Setup cards-per-lane default
+  const cardsPerLaneSelect = document.getElementById("cardsPerLaneSelect") as HTMLSelectElement | null;
+  if (cardsPerLaneSelect && getUser()) {
+    let cardsPerLaneSaving = false;
+    cardsPerLaneSelect.addEventListener("change", async () => {
+      if (cardsPerLaneSaving) return;
+      const previous = getDefaultCardsPerLane();
+      const parsed = parseInt(cardsPerLaneSelect.value, 10);
+      const next = Number.isFinite(parsed) ? parsed : previous;
+      if (next === previous) {
+        cardsPerLaneSelect.value = String(previous);
+        return;
+      }
+
+      cardsPerLaneSaving = true;
+      cardsPerLaneSelect.disabled = true;
+      let saved = false;
+      try {
+        await apiFetch("/api/user/preferences", {
+          method: "PUT",
+          body: JSON.stringify({ key: CARDS_PER_LANE_PREFERENCE_KEY, value: String(next) }),
+        });
+        setDefaultCardsPerLane(next);
+        saved = true;
+        clearBoardPrefetchCache();
+        // Drop stale projects-list prefetch from history so F5 cannot resurrect a
+        // board payload fetched under the previous limitPerLane.
+        if ((history.state as { boardData?: unknown } | null)?.boardData) {
+          history.replaceState({}, "", window.location.pathname + window.location.search + window.location.hash);
+        }
+        // Apply immediately on the open board (and on next F5 via preference hydration).
+        const slug = getSlug();
+        if (slug) {
+          usePreferenceLimitOnNextBoardRequest();
+          void invalidateBoard(
+            slug,
+            getTag(),
+            getSearch(),
+            getSprintIdFromUrl(),
+            getAssigneeFromUrl(),
+            getSortFromUrl(),
+            getPriorityFromUrl(),
+          );
+        }
+        showToast(t("settings.customization.cardsPerLane.toast.updated"));
+      } catch (err: any) {
+        showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.customization.cardsPerLane.toast.updateFailed" }));
+      } finally {
+        cardsPerLaneSaving = false;
+        cardsPerLaneSelect.disabled = false;
+        cardsPerLaneSelect.value = String(saved ? getDefaultCardsPerLane() : previous);
+      }
+    }, { signal });
+  }
 
   function syncWallpaperRadiosFromState(): void {
     const st = getStoredWallpaperState();
@@ -2070,6 +2458,18 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
       );
     }
 
+    const wrapLanesToggle = document.getElementById("wrapLanesToggle") as HTMLInputElement | null;
+    if (wrapLanesToggle) {
+      wrapLanesToggle.addEventListener(
+        "change",
+        () => {
+          setWrapLanesPreference(wrapLanesToggle.checked);
+          syncOpenBoardWrapLanesClass();
+        },
+        { signal }
+      );
+    }
+
     const desktopNotifyBtn = document.getElementById("desktopNotifyEnableBtn");
     if (desktopNotifyBtn && !desktopNotifyBtn.hasAttribute("disabled")) {
       desktopNotifyBtn.addEventListener(
@@ -2128,6 +2528,48 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
         );
       }
     }
+    const emailNotifyEnabledToggle = document.getElementById("emailNotifyEnabledToggle") as HTMLInputElement | null;
+    if (emailNotifyEnabledToggle && !emailNotifyEnabledToggle.hasAttribute("disabled")) {
+      emailNotifyEnabledToggle.addEventListener(
+        "change",
+        async () => {
+          const pref = getEmailNotifyViewState().value;
+          if (!pref) return;
+          document.querySelectorAll<HTMLInputElement>("#emailNotifyEnabledToggle, .email-notify-category-toggle").forEach((control) => {
+            control.disabled = true;
+          });
+          try {
+            await setEmailNotifyPref({ ...pref, enabled: emailNotifyEnabledToggle.checked });
+          } catch {
+            showToast(t("settings.customization.emailNotify.saveFailed"));
+          }
+          await renderSettingsModal();
+        },
+        { signal }
+      );
+    }
+    document.querySelectorAll<HTMLInputElement>(".email-notify-category-toggle").forEach((toggle) => {
+      if (toggle.hasAttribute("disabled")) return;
+      toggle.addEventListener(
+        "change",
+        async () => {
+          const category = toggle.getAttribute("data-category") as EmailNotifyCategory | null;
+          if (!category) return;
+          const pref = getEmailNotifyViewState().value;
+          if (!pref) return;
+          document.querySelectorAll<HTMLInputElement>("#emailNotifyEnabledToggle, .email-notify-category-toggle").forEach((control) => {
+            control.disabled = true;
+          });
+          try {
+            await setEmailNotifyPref({ ...pref, [category]: toggle.checked });
+          } catch {
+            showToast(t("settings.customization.emailNotify.saveFailed"));
+          }
+          await renderSettingsModal();
+        },
+        { signal }
+      );
+    });
     resetKeybindingCaptureUI();
     document.querySelectorAll("[data-keybinding-capture]").forEach((btn) => {
       btn.addEventListener(
@@ -2176,12 +2618,88 @@ export async function renderSettingsModal(options?: { skipProfileRefetch?: boole
     });
   }
 
-  // Setup event listeners for color pickers (only if we have project access)
+  // Setup event listeners for color pickers (scope selects mine vs board/project routes)
   bindTagTabInteractions({
     signal,
-    hasProjectAccess,
+    scope: tagSettingsScope,
     rerender: () => renderSettingsModal(),
   });
+}
+
+// Roles an admin may pick as the auto-enrollment level for the default
+// board. Mirrors the backend's IsValidProjectRole set (owner/editor are
+// deprecated aliases, never offered here).
+const DEFAULT_BOARD_ROLES = ["viewer", "contributor", "maintainer"];
+
+// Renders the org-wide "default board for new users" admin control shown at the
+// top of the Users tab. The enable toggle maps onto the existing admin API:
+// disabled == unset (`customized:false`), enabled == a saved `projectId` (and
+// `role`, defaulting to viewer server-side when omitted). Turning the toggle
+// off clears via DELETE; picking a project or role saves via PUT. This never
+// enrolls existing users -- it only seeds users created afterward.
+function renderDefaultBoardSection(setting: any, projects: any[]): string {
+  const loadFailed = !setting;
+  const customized = !!(setting && setting.customized);
+  const configuredId = customized && typeof setting.projectId === "number" ? setting.projectId : null;
+  const configuredRole = DEFAULT_BOARD_ROLES.includes(setting?.role) ? setting.role : "viewer";
+
+  // Only durable projects the requester maintains are valid write targets
+  // (mirrors the store-side rule); temporary/anonymous boards are excluded.
+  const durable = Array.isArray(projects) ? projects.filter((p: any) => !p.expiresAt) : [];
+  const eligible = durable.filter((p: any) => (p.role || "").toLowerCase() === "maintainer");
+
+  // If the configured board is no longer maintainer-eligible (e.g. access was
+  // lost), still surface it as the current selection so the admin can see and
+  // clear it, even though re-saving that id would be rejected by the backend.
+  let extraOptionHTML = "";
+  if (configuredId != null && !eligible.some((p: any) => p.id === configuredId)) {
+    const current = durable.find((p: any) => p.id === configuredId);
+    const label = current ? current.name : `#${configuredId}`;
+    extraOptionHTML = `<option value="${configuredId}" selected>${escapeHTML(label)}</option>`;
+  }
+
+  const optionsHTML = eligible.map((p: any) =>
+    `<option value="${p.id}" ${p.id === configuredId ? "selected" : ""}>${escapeHTML(p.name)}</option>`
+  ).join("");
+
+  const hasEligible = eligible.length > 0 || extraOptionHTML !== "";
+
+  const roleOptionsHTML = DEFAULT_BOARD_ROLES.map((role) =>
+    `<option value="${role}" ${role === configuredRole ? "selected" : ""}>${escapeHTML(t(`board.members.role.${role}`))}</option>`
+  ).join("");
+
+  const controlsHTML = loadFailed
+    ? `<p class="muted" style="margin:8px 0;font-size:13px;" data-i18n-text="settings.users.defaultBoard.loadFailed">Could not load the default board setting. Reload the page to try again.</p>`
+    : `
+        <label class="row" style="align-items:center;gap:8px;margin-top:10px;cursor:pointer;">
+          <input type="checkbox" id="defaultBoardEnabledToggle" data-customized="${customized ? "true" : "false"}" ${customized ? "checked" : ""} />
+          <span data-i18n-text="settings.users.defaultBoard.enableLabel">Enroll new users on a default board</span>
+        </label>
+        <div id="defaultBoardSelectRow" style="margin-top:10px;"${customized ? "" : " hidden"}>
+          ${hasEligible ? `
+          <label class="field" style="display:block;">
+            <span class="muted" data-i18n-text="settings.users.defaultBoard.selectLabel">Default board</span>
+            <select id="defaultBoardProjectSelect" class="input" style="display:block;margin-top:4px;">
+              <option value="" data-i18n-text="settings.users.defaultBoard.placeholder" ${configuredId == null ? "selected" : ""}>Select a project…</option>
+              ${extraOptionHTML}
+              ${optionsHTML}
+            </select>
+          </label>
+          <label class="field" style="display:block;margin-top:10px;">
+            <span class="muted" data-i18n-text="settings.users.defaultBoard.roleLabel">Role for new members</span>
+            <select id="defaultBoardRoleSelect" class="input" style="display:block;margin-top:4px;"${configuredId == null ? " disabled" : ""}>
+              ${roleOptionsHTML}
+            </select>
+          </label>` : `<p class="muted" style="margin:0;font-size:13px;" data-i18n-text="settings.users.defaultBoard.noEligibleProjects">You have no durable boards you maintain to use as a default.</p>`}
+        </div>`;
+
+  return `
+      <div class="settings-section">
+        <div class="settings-section__title" data-i18n-text="settings.users.defaultBoard.title">Default board for new users</div>
+        <div class="settings-section__description muted" data-i18n-text="settings.users.defaultBoard.description">New users are auto-enrolled on this board at the selected role when their account is created. Changing or turning this off never affects existing users.</div>
+        ${controlsHTML}
+      </div>
+  `;
 }
 
 async function renderUsersTabContent(): Promise<string> {
@@ -2190,10 +2708,16 @@ async function renderUsersTabContent(): Promise<string> {
   const isAdmin = currentUser?.systemRole === "admin";
 
   try {
-    const users: any[] = await apiFetch("/api/admin/users");
-    
+    const [users, defaultBoardSetting, projects] = await Promise.all([
+      apiFetch("/api/admin/users") as Promise<any[]>,
+      apiFetch("/api/admin/settings/default-board").catch(() => null),
+      apiFetch("/api/projects").catch(() => []) as Promise<any[]>,
+    ]);
+
+    const defaultBoardHTML = renderDefaultBoardSection(defaultBoardSetting, projects);
+
     if (users.length === 0) {
-      return `<div class="settings-section"><div class="muted" data-i18n-text="settings.users.empty">No users found.</div></div>`;
+      return `${defaultBoardHTML}<div class="settings-section"><div class="muted" data-i18n-text="settings.users.empty">No users found.</div></div>`;
     }
 
     const rows = users.map((user: any) => {
@@ -2220,7 +2744,7 @@ async function renderUsersTabContent(): Promise<string> {
             <div class="users-table__actions">
               <button class="btn btn--ghost btn--small" data-action="demote" data-user-id="${user.id}" data-user-role="${userRole}" data-i18n-text="settings.users.actions.demote">Demote</button>
               <button class="btn btn--danger btn--small" data-action="delete" data-user-id="${user.id}" data-i18n-text="settings.users.actions.delete">Delete</button>
-              <button class="btn btn--ghost btn--small" data-action="password" data-user-id="${user.id}" data-i18n-text="settings.users.actions.password">Password</button>
+			  ${getLocalAuthEnabled() && user.hasLocalPassword ? `<button class="btn btn--ghost btn--small" data-action="password" data-user-id="${user.id}" data-i18n-text="settings.users.actions.password">Scrumboy password</button>` : ""}
             </div>
           `;
         } else if (isUserRole) {
@@ -2229,7 +2753,7 @@ async function renderUsersTabContent(): Promise<string> {
             <div class="users-table__actions">
               <button class="btn btn--ghost btn--small" data-action="promote" data-user-id="${user.id}" data-user-role="${userRole}" data-i18n-text="settings.users.actions.promote">Promote</button>
               <button class="btn btn--danger btn--small" data-action="delete" data-user-id="${user.id}" data-i18n-text="settings.users.actions.delete">Delete</button>
-              <button class="btn btn--ghost btn--small" data-action="password" data-user-id="${user.id}" data-i18n-text="settings.users.actions.password">Password</button>
+			  ${getLocalAuthEnabled() && user.hasLocalPassword ? `<button class="btn btn--ghost btn--small" data-action="password" data-user-id="${user.id}" data-i18n-text="settings.users.actions.password">Scrumboy password</button>` : ""}
             </div>
           `;
         }
@@ -2240,17 +2764,26 @@ async function renderUsersTabContent(): Promise<string> {
 
       const roleDisplay = userRole.charAt(0).toUpperCase() + userRole.slice(1);
       const userDisplay = user.name || user.email || `User ${user.id}`;
+	  const authKey = user.hasLocalPassword && user.oidcLinked
+	    ? "settings.profile.authentication.dual"
+	    : user.hasLocalPassword
+	      ? "settings.profile.authentication.local"
+	      : user.oidcLinked
+	        ? "settings.profile.authentication.sso"
+	        : "settings.profile.authentication.none";
 
       return `
         <tr>
           <td>${escapeHTML(userDisplay)}${user.email && user.name ? ` <span class="muted">(${escapeHTML(user.email)})</span>` : ""}</td>
           <td>${escapeHTML(roleDisplay)}</td>
+		  <td data-i18n-text="${authKey}">${escapeHTML(t(authKey))}</td>
           <td>${actionsHTML}</td>
         </tr>
       `;
     }).join("");
 
     return `
+      ${defaultBoardHTML}
       <div class="settings-section">
         <div class="settings-section__title" data-i18n-text="settings.users.management.title">User Management</div>
         <div class="settings-section__description muted" data-i18n-text="settings.users.management.description">Manage system users and roles.</div>
@@ -2259,6 +2792,7 @@ async function renderUsersTabContent(): Promise<string> {
             <tr>
               <th style="width: 35%;" data-i18n-text="settings.users.table.user">User</th>
               <th data-i18n-text="settings.users.table.systemRole">System Role</th>
+			  <th data-i18n-text="settings.users.table.authentication">Authentication</th>
               <th data-i18n-text="settings.users.table.actions">Actions</th>
             </tr>
           </thead>
@@ -2297,14 +2831,11 @@ function showPasswordResetDialog(userId: string): void {
   (dialog as HTMLDialogElement).showModal();
   const releaseLocale = bindDialogLocale(dialog);
 
-  const closeBtn = document.getElementById("passwordResetDialogClose");
-  const cancelBtn = document.getElementById("passwordResetCancel");
-  const form = document.getElementById("passwordResetForm") as HTMLFormElement;
+  const closeBtn = dialog.querySelector<HTMLElement>("#passwordResetDialogClose");
+  const cancelBtn = dialog.querySelector<HTMLElement>("#passwordResetCancel");
+  const form = dialog.querySelector<HTMLFormElement>("#passwordResetForm");
 
-  const close = () => {
-    releaseLocale();
-    document.body.removeChild(dialog);
-  };
+  const close = attachDialogClose(dialog, releaseLocale);
 
   if (closeBtn) closeBtn.addEventListener("click", close);
   if (cancelBtn) cancelBtn.addEventListener("click", close);
@@ -2364,14 +2895,11 @@ function showPasswordResetFallbackDialog(resetUrl: string): void {
   (dialog as HTMLDialogElement).showModal();
   const releaseLocale = bindDialogLocale(dialog);
 
-  const closeBtn = document.getElementById("passwordResetFallbackClose");
-  const copyBtn = document.getElementById("passwordResetFallbackCopy");
-  const urlInput = document.getElementById("passwordResetUrlDisplay") as HTMLInputElement;
+  const closeBtn = dialog.querySelector<HTMLElement>("#passwordResetFallbackClose");
+  const copyBtn = dialog.querySelector<HTMLElement>("#passwordResetFallbackCopy");
+  const urlInput = dialog.querySelector<HTMLInputElement>("#passwordResetUrlDisplay");
 
-  const close = () => {
-    releaseLocale();
-    document.body.removeChild(dialog);
-  };
+  const close = attachDialogClose(dialog, releaseLocale);
 
   if (closeBtn) closeBtn.addEventListener("click", close);
   dialog.addEventListener("click", (e) => {
@@ -2458,13 +2986,13 @@ function showCreateUserDialog(): void {
   document.body.appendChild(dialog);
   (dialog as HTMLDialogElement).showModal();
 
-  const closeBtn = document.getElementById("createUserDialogClose");
-  const cancelBtn = document.getElementById("createUserCancel");
-  const form = document.getElementById("createUserForm") as HTMLFormElement;
-  const emailInput = document.getElementById("createUserEmail") as HTMLInputElement;
-  const nameInput = document.getElementById("createUserName") as HTMLInputElement;
-  const passwordInput = document.getElementById("createUserPassword") as HTMLInputElement;
-  const passwordToggle = document.getElementById("createUserPasswordToggle");
+  const closeBtn = dialog.querySelector<HTMLElement>("#createUserDialogClose");
+  const cancelBtn = dialog.querySelector<HTMLElement>("#createUserCancel");
+  const form = dialog.querySelector<HTMLFormElement>("#createUserForm");
+  const emailInput = dialog.querySelector<HTMLInputElement>("#createUserEmail");
+  const nameInput = dialog.querySelector<HTMLInputElement>("#createUserName");
+  const passwordInput = dialog.querySelector<HTMLInputElement>("#createUserPassword");
+  const passwordToggle = dialog.querySelector<HTMLElement>("#createUserPasswordToggle");
   const passwordIconPath = passwordToggle?.querySelector("path");
 
   const PATH_SHOW = "M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z";
@@ -2490,10 +3018,9 @@ function showCreateUserDialog(): void {
     });
   }
 
-  const close = () => {
-    releaseLocale();
-    document.body.removeChild(dialog);
-  };
+  const close = attachDialogClose(dialog, releaseLocale, () => {
+    if (passwordInput) passwordInput.value = "";
+  });
 
   if (closeBtn) {
     closeBtn.addEventListener("click", close);
@@ -2507,7 +3034,7 @@ function showCreateUserDialog(): void {
     }
   });
 
-  if (form) {
+  if (form && emailInput && nameInput && passwordInput) {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const email = emailInput.value.trim();
@@ -2529,6 +3056,148 @@ function showCreateUserDialog(): void {
         showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.users.createUser.failed" }));
       }
     });
+  }
+}
+
+type OIDCAuthorizationResponse = {
+  authorizationEndpoint: string;
+  authorizationParameters: Record<string, string>;
+};
+
+function submitOIDCAuthorizationForm(request: OIDCAuthorizationResponse): void {
+  const endpoint = new URL(request.authorizationEndpoint, window.location.origin);
+  if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") {
+    throw new Error(t("settings.profile.authentication.providerInvalid"));
+  }
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = endpoint.toString();
+  form.referrerPolicy = "no-referrer";
+  for (const [name, value] of Object.entries(request.authorizationParameters || {})) {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  form.submit();
+}
+
+async function beginSetScrumboyPassword(): Promise<void> {
+  try {
+    const status = await apiFetch<{ authorized: boolean; localAuthEnabled: boolean }>("/api/auth/oidc/set-password/status");
+    if (status.authorized) {
+      showSetScrumboyPasswordDialog(status.localAuthEnabled);
+      return;
+    }
+    const request = await apiFetch<OIDCAuthorizationResponse>("/api/auth/oidc/set-password/start", { method: "POST" });
+    submitOIDCAuthorizationForm(request);
+  } catch (err: any) {
+    showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.profile.authentication.startFailed" }));
+  }
+}
+
+function showSetScrumboyPasswordDialog(localAuthEnabled: boolean): void {
+  const u = getUser();
+  if (!u) return;
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="dialog__form" id="setScrumboyPasswordForm">
+      <div class="dialog__header">
+        <div class="dialog__title" data-i18n-text="settings.profile.authentication.setPassword">Set Scrumboy password</div>
+        <button class="btn btn--ghost" type="button" id="setScrumboyPasswordClose" data-i18n-aria-label="common.close">✕</button>
+      </div>
+      <div class="muted" data-i18n-text="settings.profile.authentication.setPasswordDescription">Your recent SSO reauthentication authorizes one first-password change for five minutes.</div>
+      ${!localAuthEnabled ? `<div role="alert" data-i18n-text="settings.profile.authentication.localDisabledSet">The password will be stored, but it cannot be used until the operator re-enables local authentication.</div>` : ""}
+      <label class="field"><div class="field__label" data-i18n-text="auth.fields.newPassword.label">New password</div><input class="input" id="setScrumboyPasswordNew" type="password" autocomplete="new-password" required /></label>
+      <label class="field"><div class="field__label" data-i18n-text="auth.fields.confirmPassword.label">Confirm password</div><input class="input" id="setScrumboyPasswordConfirm" type="password" autocomplete="new-password" required /></label>
+      ${u.twoFactorEnabled ? `<label class="field"><div class="field__label" data-i18n-text="settings.profile.authentication.twoFactorCode">Authenticator or recovery code</div><input class="input" id="setScrumboyPassword2FA" type="text" autocomplete="one-time-code" required /></label>` : ""}
+      <div class="dialog__footer"><div class="spacer"></div><button class="btn btn--ghost" type="button" id="setScrumboyPasswordCancel" data-i18n-text="common.cancel">Cancel</button><button class="btn" type="submit" data-i18n-text="settings.profile.authentication.savePassword">Save password</button></div>
+    </form>`;
+  document.body.appendChild(dialog);
+  (dialog as HTMLDialogElement).showModal();
+  const releaseLocale = bindDialogLocale(dialog);
+  let removed = false;
+  const close = () => {
+    if (removed) return;
+    removed = true;
+    dialog.querySelectorAll<HTMLInputElement>('input[type="password"], input[autocomplete="one-time-code"]').forEach((input) => { input.value = ""; });
+    releaseLocale();
+    dialog.remove();
+  };
+  dialog.querySelector("#setScrumboyPasswordClose")?.addEventListener("click", close);
+  dialog.querySelector("#setScrumboyPasswordCancel")?.addEventListener("click", close);
+  dialog.addEventListener("click", (event) => { if (event.target === dialog) close(); });
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+  dialog.addEventListener("close", close);
+  dialog.querySelector("form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const password = (dialog.querySelector("#setScrumboyPasswordNew") as HTMLInputElement).value;
+    const confirmation = (dialog.querySelector("#setScrumboyPasswordConfirm") as HTMLInputElement).value;
+    if (password !== confirmation) { showToast(t("auth.reset.passwordsMismatch")); return; }
+    const twoFactorCode = (dialog.querySelector("#setScrumboyPassword2FA") as HTMLInputElement | null)?.value || "";
+    try {
+      await apiFetch("/api/auth/oidc/set-password", { method: "POST", body: JSON.stringify({ newPassword: password, twoFactorCode }) });
+      const updated = await apiFetch<User>("/api/me");
+      setUser(updated);
+      close();
+      showToast(t("settings.profile.authentication.passwordSet"));
+      await renderSettingsModal({ skipProfileRefetch: true });
+    } catch (err: any) {
+      showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.profile.authentication.setFailed" }));
+    }
+  });
+}
+
+function showConnectSSODialog(): void {
+  const u = getUser();
+  if (!u) return;
+  const dialog = document.createElement("dialog");
+  dialog.className = "dialog";
+  dialog.innerHTML = `
+    <form method="dialog" class="dialog__form" id="connectSSOForm">
+      <div class="dialog__header"><div class="dialog__title" data-i18n-text="settings.profile.authentication.connectSSO">Connect SSO</div><button class="btn btn--ghost" type="button" id="connectSSOClose" data-i18n-aria-label="common.close">✕</button></div>
+      <div class="muted" data-i18n-text="settings.profile.authentication.connectDescription">Confirm your current Scrumboy password, then reauthenticate with SSO. The verified SSO email must match your Scrumboy email.</div>
+      <label class="field"><div class="field__label" data-i18n-text="settings.profile.authentication.currentPassword">Current Scrumboy password</div><input class="input" id="connectSSOPassword" type="password" autocomplete="current-password" required /></label>
+      ${u.twoFactorEnabled ? `<label class="field"><div class="field__label" data-i18n-text="settings.profile.authentication.twoFactorCode">Authenticator or recovery code</div><input class="input" id="connectSSO2FA" type="text" autocomplete="one-time-code" required /></label>` : ""}
+      <div class="dialog__footer"><div class="spacer"></div><button class="btn btn--ghost" type="button" id="connectSSOCancel" data-i18n-text="common.cancel">Cancel</button><button class="btn" type="submit" data-i18n-text="settings.profile.authentication.continueSSO">Continue with SSO</button></div>
+    </form>`;
+  document.body.appendChild(dialog);
+  (dialog as HTMLDialogElement).showModal();
+  const releaseLocale = bindDialogLocale(dialog);
+  let removed = false;
+  const close = () => {
+    if (removed) return;
+    removed = true;
+    dialog.querySelectorAll<HTMLInputElement>('input[type="password"], input[autocomplete="one-time-code"]').forEach((input) => { input.value = ""; });
+    releaseLocale();
+    dialog.remove();
+  };
+  dialog.querySelector("#connectSSOClose")?.addEventListener("click", close);
+  dialog.querySelector("#connectSSOCancel")?.addEventListener("click", close);
+  dialog.addEventListener("click", (event) => { if (event.target === dialog) close(); });
+  dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
+  dialog.addEventListener("close", close);
+  dialog.querySelector("form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const currentPassword = (dialog.querySelector("#connectSSOPassword") as HTMLInputElement).value;
+    const twoFactorCode = (dialog.querySelector("#connectSSO2FA") as HTMLInputElement | null)?.value || "";
+    try {
+      const request = await apiFetch<OIDCAuthorizationResponse>("/api/auth/oidc/link/start", { method: "POST", body: JSON.stringify({ currentPassword, twoFactorCode, returnTo: "/?auth_method=linked" }) });
+      submitOIDCAuthorizationForm(request);
+    } catch (err: any) {
+      showToast(apiErrorMessageOrRaw(err, { fallbackKey: "settings.profile.authentication.linkFailed" }));
+    }
+  });
+}
+
+export async function resumeAuthenticationMethodFlow(kind: string): Promise<void> {
+  if (kind === "set_password") {
+    await beginSetScrumboyPassword();
+  } else if (kind === "linked") {
+    showToast(t("settings.profile.authentication.linked"));
   }
 }
 
@@ -2572,20 +3241,20 @@ async function showEnable2FADialog(): Promise<void> {
     (dialog as HTMLDialogElement).showModal();
     const releaseLocale = bindDialogLocale(dialog);
 
-    const close = () => {
-      releaseLocale();
-      document.body.removeChild(dialog);
-    };
+    const form = dialog.querySelector<HTMLFormElement>("#enable2FAForm");
+    const codeInput = dialog.querySelector<HTMLInputElement>("#enable2FACode");
+    const errorEl = dialog.querySelector<HTMLElement>("#enable2FAError");
 
-    document.getElementById("enable2FAClose")?.addEventListener("click", close);
-    document.getElementById("enable2FACancel")?.addEventListener("click", close);
+    const close = attachDialogClose(dialog, releaseLocale, () => {
+      if (codeInput) codeInput.value = "";
+    });
+
+    dialog.querySelector<HTMLElement>("#enable2FAClose")?.addEventListener("click", close);
+    dialog.querySelector<HTMLElement>("#enable2FACancel")?.addEventListener("click", close);
     dialog.addEventListener("click", (e) => {
       if (e.target === dialog) close();
     });
 
-    const form = document.getElementById("enable2FAForm");
-    const codeInput = document.getElementById("enable2FACode") as HTMLInputElement;
-    const errorEl = document.getElementById("enable2FAError") as HTMLElement | null;
     const showError = (msg: string) => {
       if (errorEl) {
         errorEl.textContent = msg;
@@ -2653,13 +3322,10 @@ function showRecoveryCodesDialog(codes: string[]): void {
   (dialog as HTMLDialogElement).showModal();
   const releaseLocale = bindDialogLocale(dialog);
 
-  const close = () => {
-    releaseLocale();
-    document.body.removeChild(dialog);
-  };
+  const close = attachDialogClose(dialog, releaseLocale);
 
-  document.getElementById("recoveryCodesClose")?.addEventListener("click", close);
-  document.getElementById("recoveryCodesDone")?.addEventListener("click", close);
+  dialog.querySelector<HTMLElement>("#recoveryCodesClose")?.addEventListener("click", close);
+  dialog.querySelector<HTMLElement>("#recoveryCodesDone")?.addEventListener("click", close);
   dialog.addEventListener("click", (e) => {
     if (e.target === dialog) close();
   });
@@ -2690,19 +3356,19 @@ function showDisable2FADialog(): void {
   (dialog as HTMLDialogElement).showModal();
   const releaseLocale = bindDialogLocale(dialog);
 
-  const close = () => {
-    releaseLocale();
-    document.body.removeChild(dialog);
-  };
+  const form = dialog.querySelector<HTMLFormElement>("#disable2FAForm");
+  const passwordInput = dialog.querySelector<HTMLInputElement>("#disable2FAPassword");
 
-  document.getElementById("disable2FAClose")?.addEventListener("click", close);
-  document.getElementById("disable2FACancel")?.addEventListener("click", close);
+  const close = attachDialogClose(dialog, releaseLocale, () => {
+    if (passwordInput) passwordInput.value = "";
+  });
+
+  dialog.querySelector<HTMLElement>("#disable2FAClose")?.addEventListener("click", close);
+  dialog.querySelector<HTMLElement>("#disable2FACancel")?.addEventListener("click", close);
   dialog.addEventListener("click", (e) => {
     if (e.target === dialog) close();
   });
 
-  const form = document.getElementById("disable2FAForm");
-  const passwordInput = document.getElementById("disable2FAPassword") as HTMLInputElement;
   if (form && passwordInput) {
     form.addEventListener("submit", async (e) => {
       e.preventDefault();

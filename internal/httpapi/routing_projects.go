@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
-	"scrumboy/internal/projectcolor"
+	boardapp "scrumboy/internal/application/board"
+	membershipapp "scrumboy/internal/application/membership"
+	projectapp "scrumboy/internal/application/project"
+	tagapp "scrumboy/internal/application/tag"
 	"scrumboy/internal/store"
 )
 
@@ -41,22 +43,6 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request, rest []s
 	if !ok {
 		writeValidationError(w, "invalid project id", "invalid_project_id", map[string]any{"field": "projectId"})
 		return
-	}
-
-	if s.mode == "anonymous" && len(rest) == 1 && r.Method == http.MethodPatch {
-		p, err := s.store.GetProject(s.requestContext(r), projectID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
-				return
-			}
-			writeStoreErr(w, err, true)
-			return
-		}
-		if p.ExpiresAt == nil || p.CreatorUserID != nil || !p.ExpiresAt.After(time.Now().UTC()) {
-			writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
-			return
-		}
 	}
 
 	if s.handleProjectsProjectItem(w, r, rest, projectID) {
@@ -132,7 +118,11 @@ func (s *Server) handleProjectsRoot(w http.ResponseWriter, r *http.Request, rest
 				})
 			}
 		}
-		p, err := s.store.CreateProjectWithWorkflow(s.requestContext(r), in.Name, workflow)
+		prepared := s.projectCreations.Prepare(s.requestContext(r), projectapp.RESTDurableCreationCommand{
+			Name:     in.Name,
+			Workflow: workflow,
+		})
+		p, err := prepared.Create()
 		if err != nil {
 			writeStoreErr(w, err, false)
 			return true
@@ -160,17 +150,27 @@ func (s *Server) handleProjectsProjectItem(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
 			return true
 		}
-		if err := s.store.DeleteProject(ctx, projectID, userID); err != nil {
+		prepared := s.projectDeletions.Prepare(ctx, projectapp.RESTDeletionCommand{
+			ProjectID:   projectID,
+			ActorUserID: userID,
+		})
+		if err := prepared.Delete(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), projectID, "project_deleted")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 
 	case http.MethodPatch:
 		ctx := s.requestContext(r)
-		userID, hasUser := store.UserIDFromContext(ctx)
+		prepared, err := s.projectUpdates.Prepare(ctx, projectapp.RESTUpdateTarget{
+			ProjectID: projectID,
+			Mode:      s.storeMode(),
+		})
+		if err != nil {
+			writeProjectUpdateError(w, err)
+			return true
+		}
 		var in struct {
 			Name  *string `json:"name"`
 			Image *string `json:"image"`
@@ -178,34 +178,13 @@ func (s *Server) handleProjectsProjectItem(w http.ResponseWriter, r *http.Reques
 		if err := readJSON(w, r, s.maxBody, &in); err != nil {
 			return true
 		}
-		if in.Image != nil {
-			if !hasUser {
-				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-				return true
-			}
-			color := projectcolor.ExtractFromDataURL(*in.Image)
-			if err := s.store.UpdateProjectImage(ctx, projectID, userID, in.Image, color); err != nil {
-				writeStoreErr(w, err, true)
-				return true
-			}
-		}
-		if in.Name != nil {
-			uid := int64(0)
-			if hasUser {
-				uid = userID
-			}
-			if err := s.store.UpdateProjectName(ctx, projectID, uid, *in.Name); err != nil {
-				writeStoreErr(w, err, true)
-				return true
-			}
-		}
-		project, err := s.store.GetProject(s.requestContext(r), projectID)
+		project, err := prepared.Update(projectapp.RESTUpdateCommand{
+			Name:  in.Name,
+			Image: in.Image,
+		})
 		if err != nil {
-			writeStoreErr(w, err, true)
+			writeProjectUpdateError(w, err)
 			return true
-		}
-		if in.Name != nil || in.Image != nil {
-			s.emitRefreshNeeded(r.Context(), projectID, "project_updated")
 		}
 		writeJSON(w, http.StatusOK, projectToJSON(project))
 		return true
@@ -216,9 +195,25 @@ func (s *Server) handleProjectsProjectItem(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func writeProjectUpdateError(w http.ResponseWriter, err error) {
+	if errors.Is(err, projectapp.ErrActorRequired) {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+		return
+	}
+	writeStoreErr(w, err, true)
+}
+
 func (s *Server) handleProjectsProjectReads(w http.ResponseWriter, r *http.Request, rest []string, projectID int64) bool {
 	if len(rest) == 2 && rest[1] == "board" && r.Method == http.MethodGet {
-		pc, err := s.store.GetProjectContextForRead(s.requestContext(r), projectID, s.storeMode())
+		// This is a supported compatibility endpoint. Its unpaged response is
+		// intentionally distinct from the preferred paged slug routes. Do not
+		// add deprecation or sunset signals without an approved API lifecycle
+		// policy and migration window.
+		ctx := s.requestContext(r)
+		prepared, err := s.boardReads.PrepareLegacy(ctx, boardapp.LegacyReadTarget{
+			ProjectID: projectID,
+			Mode:      s.storeMode(),
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
@@ -228,17 +223,45 @@ func (s *Server) handleProjectsProjectReads(w http.ResponseWriter, r *http.Reque
 		if search == "" {
 			search = ""
 		}
-		sprintFilter, err := s.parseSprintFilterFromQuery(r, projectID)
+		assigneeFilter, err := s.parseAssigneeFilterFromQuery(ctx, r)
+		if err != nil {
+			writeValidationError(w, "invalid assignee", "invalid_assignee", map[string]any{"field": "assignee"})
+			return true
+		}
+		priorityFilter, err := s.parsePriorityFilterFromQuery(r)
+		if err != nil {
+			writeValidationError(w, "invalid priority", "invalid_priority", map[string]any{"field": "priority"})
+			return true
+		}
+		sprintFilter, err := s.parseSprintFilterFromQuery(r)
 		if err != nil {
 			writeValidationError(w, err.Error(), "invalid_sprint_id", map[string]any{"field": "sprintId"})
 			return true
 		}
-		project, tags, workflow, cols, err := s.store.GetBoard(s.requestContext(r), &pc, tag, search, sprintFilter)
+		sortOrder, err := s.parseSortOrderFromQuery(r)
+		if err != nil {
+			writeValidationError(w, "invalid sort", "invalid_sort", map[string]any{"field": "sort"})
+			return true
+		}
+		result, err := prepared.Read(boardapp.LegacyQuery{
+			TagFilter:      tag,
+			SearchFilter:   search,
+			AssigneeFilter: assigneeFilter,
+			PriorityFilter: priorityFilter,
+			SprintFilter:   sprintFilter,
+			SortOrder:      sortOrder,
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		writeJSON(w, http.StatusOK, boardToJSON(project, workflow, tags, cols))
+		writeJSON(w, http.StatusOK, boardToJSON(
+			result.Project,
+			result.Workflow,
+			result.Priorities,
+			result.Tags,
+			result.Columns,
+		))
 		return true
 	}
 
@@ -297,23 +320,27 @@ func (s *Server) handleProjectsProjectMembers(w http.ResponseWriter, r *http.Req
 			return true
 		}
 
-		userID, ok := store.UserIDFromContext(s.requestContext(r))
-		if !ok {
+		ctx := s.requestContext(r)
+		prepared, err := s.membershipMutations.Prepare(ctx, membershipapp.ResolvedRESTMutationTarget{
+			ProjectID: projectID,
+		})
+		if errors.Is(err, membershipapp.ErrActorRequired) {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
 			return true
 		}
-
-		if err := s.store.AddProjectMember(s.requestContext(r), userID, projectID, in.UserID, role); err != nil {
-			writeStoreErr(w, err, true)
+		if err != nil {
+			writeInternal(w, err)
 			return true
 		}
 
-		members, err := s.store.ListProjectMembers(s.requestContext(r), projectID, userID)
+		members, err := prepared.Add(membershipapp.AddCommand{
+			TargetUserID: in.UserID,
+			Role:         role,
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitMembersUpdated(r.Context(), projectID)
 		writeJSON(w, http.StatusOK, projectMembersToJSON(members))
 		return true
 	}
@@ -325,23 +352,24 @@ func (s *Server) handleProjectsProjectMembers(w http.ResponseWriter, r *http.Req
 			return true
 		}
 
-		requesterID, ok := store.UserIDFromContext(s.requestContext(r))
-		if !ok {
+		ctx := s.requestContext(r)
+		prepared, err := s.membershipMutations.Prepare(ctx, membershipapp.ResolvedRESTMutationTarget{
+			ProjectID: projectID,
+		})
+		if errors.Is(err, membershipapp.ErrActorRequired) {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
 			return true
 		}
-
-		if err := s.store.RemoveProjectMember(s.requestContext(r), requesterID, projectID, targetUserID); err != nil {
-			writeStoreErr(w, err, true)
+		if err != nil {
+			writeInternal(w, err)
 			return true
 		}
 
-		members, err := s.store.ListProjectMembers(s.requestContext(r), projectID, requesterID)
+		members, err := prepared.Remove(membershipapp.RemoveCommand{TargetUserID: targetUserID})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitMembersUpdated(r.Context(), projectID)
 		writeJSON(w, http.StatusOK, projectMembersToJSON(members))
 		return true
 	}
@@ -363,12 +391,23 @@ func (s *Server) handleProjectsProjectMembers(w http.ResponseWriter, r *http.Req
 			writeValidationError(w, "invalid role", "invalid_role", map[string]any{"field": "role"})
 			return true
 		}
-		requesterID, ok := store.UserIDFromContext(s.requestContext(r))
-		if !ok {
+		ctx := s.requestContext(r)
+		prepared, err := s.membershipMutations.Prepare(ctx, membershipapp.ResolvedRESTMutationTarget{
+			ProjectID: projectID,
+		})
+		if errors.Is(err, membershipapp.ErrActorRequired) {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
 			return true
 		}
-		if err := s.store.UpdateProjectMemberRole(s.requestContext(r), requesterID, projectID, targetUserID, role); err != nil {
+		if err != nil {
+			writeInternal(w, err)
+			return true
+		}
+		members, err := prepared.UpdateRole(membershipapp.UpdateRoleCommand{
+			TargetUserID: targetUserID,
+			Role:         role,
+		})
+		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrNotFound):
 				writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
@@ -383,12 +422,6 @@ func (s *Server) handleProjectsProjectMembers(w http.ResponseWriter, r *http.Req
 			}
 			return true
 		}
-		members, err := s.store.ListProjectMembers(s.requestContext(r), projectID, requesterID)
-		if err != nil {
-			writeStoreErr(w, err, true)
-			return true
-		}
-		s.emitMembersUpdated(r.Context(), projectID)
 		writeJSON(w, http.StatusOK, projectMembersToJSON(members))
 		return true
 	}
@@ -433,21 +466,17 @@ func (s *Server) handleProjectsProjectTags(w http.ResponseWriter, r *http.Reques
 			writeStoreErr(w, err, true)
 			return true
 		}
-		tagList := make([]store.TagWithColor, len(tags))
-		for i, tc := range tags {
-			tagList[i] = store.TagWithColor{
-				TagID:     tc.TagID,
-				Name:      tc.Name,
-				Color:     tc.Color,
-				CanDelete: tc.CanDelete,
-			}
-		}
-		writeJSON(w, http.StatusOK, tagsToJSON(tagList))
+		writeJSON(w, http.StatusOK, tagCountsToJSON(tags))
 		return true
 	}
 
 	if len(rest) == 5 && rest[1] == "tags" && rest[2] == "id" && rest[4] == "color" && r.Method == http.MethodPatch {
 		ctx := s.requestContext(r)
+		userID, ok := store.UserIDFromContext(ctx)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			return true
+		}
 		var tagID int64
 		if _, err := fmt.Sscanf(rest[3], "%d", &tagID); err != nil || tagID <= 0 {
 			writeValidationError(w, "invalid tagId", "invalid_tag_id", map[string]any{"field": "tagId"})
@@ -459,21 +488,64 @@ func (s *Server) handleProjectsProjectTags(w http.ResponseWriter, r *http.Reques
 		if err := readJSON(w, r, s.maxBody, &in); err != nil {
 			return true
 		}
-		var viewerUserID *int64
-		if userID, ok := store.UserIDFromContext(ctx); ok {
-			viewerUserID = &userID
+		// Durable numeric project route: project-aware membership + role checks.
+		prepared, err := s.tagColors.PrepareProjectID(ctx, tagapp.ProjectIDColorCommand{
+			Project:      tagapp.ResolvedProject{ProjectID: projectID, Kind: tagapp.DurableProject},
+			ViewerUserID: &userID,
+			TagID:        tagID,
+			Color:        tagapp.NewColorIntent(in.Color),
+		})
+		if err != nil {
+			writeTagColorPrepareError(w, err)
+			return true
 		}
-		if err := s.store.UpdateTagColor(ctx, viewerUserID, tagID, in.Color); err != nil {
+		if err := prepared.Update(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), projectID, "tag_color_updated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
+	// PATCH /api/projects/{id}/tags/{name}/color - set the viewer's personal color for a
+	// grouped personal label. Any authenticated member may set their own display color;
+	// SetViewerTagColorByName rejects non-members and temporary boards.
+	//
+	// KNOWN LIMITATION: a personal color preference is stored per backing tag row, and
+	// those rows are shared across the viewer's other projects, so this write can change
+	// what the viewer sees elsewhere. Only the current project gets a refresh event; the
+	// viewer's other boards pick the new color up on their next load. This is deliberate:
+	// the change is invisible to every other member, so broadcasting refreshes to their
+	// boards would be pure noise.
 	if len(rest) == 4 && rest[1] == "tags" && rest[3] == "color" && r.Method == http.MethodPatch {
-		writeValidationError(w, "name-based color update not allowed for durable projects; use /tags/id/{tagId}/color", "name_based_tag_route_not_allowed", nil)
+		ctx := s.requestContext(r)
+		userID, ok := store.UserIDFromContext(ctx)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			return true
+		}
+		tagName := rest[2]
+		var in struct {
+			Color *string `json:"color"`
+		}
+		if err := readJSON(w, r, s.maxBody, &in); err != nil {
+			return true
+		}
+		prepared, err := s.tagColors.PrepareProjectName(ctx, tagapp.ProjectNameColorCommand{
+			Project:      tagapp.ResolvedProject{ProjectID: projectID, Kind: tagapp.DurableProject},
+			ViewerUserID: &userID,
+			Name:         tagName,
+			Color:        tagapp.NewColorIntent(in.Color),
+		})
+		if err != nil {
+			writeTagColorPrepareError(w, err)
+			return true
+		}
+		if err := prepared.Update(); err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
@@ -489,17 +561,49 @@ func (s *Server) handleProjectsProjectTags(w http.ResponseWriter, r *http.Reques
 			writeValidationError(w, "invalid tagId", "invalid_tag_id", map[string]any{"field": "tagId"})
 			return true
 		}
-		if err := s.store.DeleteTag(ctx, userID, tagID, false); err != nil {
-			writeStoreErr(w, err, true)
+		prepared, err := s.tagDeletions.PrepareProjectID(ctx, tagapp.ProjectIDDeleteCommand{
+			Project:     tagapp.ResolvedProject{ProjectID: projectID, Kind: tagapp.DurableProject},
+			ActorUserID: &userID,
+			TagID:       tagID,
+		})
+		if err != nil {
+			writeTagDeletionError(w, err)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), projectID, "tag_deleted")
+		if err := prepared.Delete(); err != nil {
+			writeTagDeletionError(w, err)
+			return true
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
+	// DELETE /api/projects/{id}/tags/{name} - delete only the caller's own personal
+	// tag rows for this canonical name. The grouped label may remain if other members
+	// still use the name. Refreshes every project affected by the (cross-project) delete.
+	// DeleteMyTagByName rejects non-members and temporary boards.
 	if len(rest) == 3 && rest[1] == "tags" && r.Method == http.MethodDelete {
-		writeValidationError(w, "name-based delete not allowed for durable projects; use /tags/id/{tagId}", "name_based_tag_route_not_allowed", nil)
+		ctx := s.requestContext(r)
+		userID, ok := store.UserIDFromContext(ctx)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			return true
+		}
+		tagName := rest[2]
+		prepared, err := s.tagDeletions.PrepareProjectName(ctx, tagapp.ProjectNameDeleteCommand{
+			Project:     tagapp.ResolvedProject{ProjectID: projectID, Kind: tagapp.DurableProject},
+			ActorUserID: &userID,
+			Name:        tagName,
+		})
+		if err != nil {
+			writeTagDeletionError(w, err)
+			return true
+		}
+		if err := prepared.Delete(); err != nil {
+			writeTagDeletionError(w, err)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 

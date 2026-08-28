@@ -42,6 +42,9 @@ func newTestHTTPServerWithOptions(t *testing.T, opts Options) (*httptest.Server,
 	}
 
 	st := store.New(sqlDB, nil)
+	if len(opts.EncryptionKey) == 32 {
+		st = store.New(sqlDB, &store.StoreOptions{EncryptionKey: opts.EncryptionKey})
+	}
 	if opts.MaxRequestBody == 0 {
 		opts.MaxRequestBody = 1 << 20
 	}
@@ -184,7 +187,6 @@ func subscribeBoardEvents(t *testing.T, client *http.Client, eventsURL string) (
 			}
 
 			eventsCh <- event
-			return
 		}
 	}()
 
@@ -1109,6 +1111,7 @@ func TestAnonymousMode_RootServesLandingAndIsIdempotent(t *testing.T) {
 	if resp.Header.Get("Content-Type") != "text/html; charset=utf-8" {
 		t.Fatalf("expected HTML, got %s", resp.Header.Get("Content-Type"))
 	}
+	assertApexLandingNegotiationHeaders(t, resp)
 	b, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(b), `href="/anon"`) {
 		t.Fatalf("expected landing page to include /anon CTA")
@@ -1126,6 +1129,7 @@ func TestAnonymousMode_RootServesLandingAndIsIdempotent(t *testing.T) {
 	}
 	assertLandingGeneratedComment(t, html)
 	assertRootLandingHreflangPolicy(t, html)
+	assertLandingLocaleBootstrapAbsent(t, html)
 
 	var after int
 	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&after); err != nil {
@@ -1133,6 +1137,122 @@ func TestAnonymousMode_RootServesLandingAndIsIdempotent(t *testing.T) {
 	}
 	if after != before {
 		t.Fatalf("expected GET / to be idempotent, count %d -> %d", before, after)
+	}
+}
+
+func TestAnonymousMode_ApexLandingLocaleNegotiation(t *testing.T) {
+	ts, sqlDB, cleanup := newTestHTTPServer(t, "anonymous")
+	defer cleanup()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var before int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&before); err != nil {
+		t.Fatalf("count before: %v", err)
+	}
+
+	do := func(path, acceptLanguage string, cookies ...*http.Cookie) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, ts.URL+path, nil)
+		if err != nil {
+			t.Fatalf("new request %s: %v", path, err)
+		}
+		if acceptLanguage != "" {
+			req.Header.Set("Accept-Language", acceptLanguage)
+		}
+		for _, cookie := range cookies {
+			req.AddCookie(cookie)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(body)
+	}
+
+	resp, _ := do("/", "fr-FR,fr;q=0.9,en;q=0.8")
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 for French browser apex, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/fr/" {
+		t.Fatalf("expected /fr/ redirect target, got %q", loc)
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	req, err := http.NewRequest(http.MethodHead, ts.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new HEAD request: %v", err)
+	}
+	req.Header.Set("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("HEAD /: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 for French browser HEAD apex, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/fr/" {
+		t.Fatalf("expected /fr/ HEAD redirect target, got %q", loc)
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	resp, _ = do("/?utm=x", "de-DE,de;q=0.9")
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 for German browser apex with query, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/de/?utm=x" {
+		t.Fatalf("expected /de/?utm=x redirect target, got %q", loc)
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	resp, body := do("/", "fr-FR,fr;q=0.9", &http.Cookie{Name: landingLocaleCookieName, Value: "en"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for English locale cookie, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `href="/anon"`) || strings.Contains(body, landingRobotsNoindex) {
+		t.Fatalf("expected English root landing body for English locale cookie")
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	resp, _ = do("/", "de-DE,de;q=0.9", &http.Cookie{Name: landingLocaleCookieName, Value: "hi"})
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 for Hindi locale cookie, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/hi/" {
+		t.Fatalf("expected /hi/ redirect target, got %q", loc)
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	resp, body = do("/hi/", "fr-FR,fr;q=0.9")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for deliberate Hindi path, got %d body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, `rel="canonical" href="https://scrumboy.com/hi/"`) {
+		t.Fatalf("expected deliberate Hindi path to serve Hindi landing")
+	}
+	if resp.Header.Get("Location") != "" {
+		t.Fatalf("expected deliberate Hindi path not to redirect, got %q", resp.Header.Get("Location"))
+	}
+
+	resp, body = do("/", "nl-NL,nl;q=0.9")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for unsupported browser language, got %d body=%s", resp.StatusCode, body)
+	}
+	assertApexLandingNegotiationHeaders(t, resp)
+
+	var after int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&after); err != nil {
+		t.Fatalf("count after: %v", err)
+	}
+	if after != before {
+		t.Fatalf("expected apex locale negotiation to be idempotent, count %d -> %d", before, after)
 	}
 }
 
@@ -1189,8 +1309,11 @@ func TestAnonymousMode_LocalizedLandingRoutes(t *testing.T) {
 		assertLandingDisplayCopy(t, locale, html)
 		assertLandingLocalizedHeroTitle(t, locale, html)
 		assertLandingJapaneseHeroStyles(t, locale, html)
+		assertLandingChineseHeroStyles(t, locale, html)
+		assertLandingRussianHeroStyles(t, locale, html)
 		assertLandingHeroLine2BreakStyles(t, locale, html)
 		assertLandingGeneratedComment(t, html)
+		assertLandingLocaleBootstrap(t, locale, html)
 		rootTag := htmlRootTag(t, html)
 		if strings.Contains(rootTag, `dir="rtl"`) {
 			t.Fatalf("expected /%s/ not to be RTL", locale)
@@ -1275,6 +1398,42 @@ func TestFullMode_LocalizedLandingPathsRemainSPA(t *testing.T) {
 	}
 }
 
+func TestFullMode_ApexIgnoresAcceptLanguageLandingNegotiation(t *testing.T) {
+	ts, _, cleanup := newTestHTTPServer(t, "full")
+	defer cleanup()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Accept-Language", "fr-FR,fr;q=0.9")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected full-mode SPA for /, got %d body=%s", resp.StatusCode, string(body))
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Fatalf("expected full-mode / not to redirect, got %q", loc)
+	}
+	if !strings.Contains(string(body), `<div id="app"></div>`) {
+		t.Fatalf("expected full-mode / to serve SPA")
+	}
+	if strings.Contains(string(body), "Generated by scripts/generate-landing.mjs") {
+		t.Fatalf("expected full-mode / not to serve landing")
+	}
+}
+
 func generatedLandingLocales(t *testing.T) []string {
 	t.Helper()
 	entries, err := embeddedWeb.ReadDir("web/landing.locales")
@@ -1318,6 +1477,57 @@ func assertLandingGeneratedComment(t *testing.T, html string) {
 	if !strings.Contains(html, landingGeneratedComment) {
 		t.Fatalf("expected landing HTML to include generated-file comment")
 	}
+}
+
+func assertLandingLocaleBootstrapAbsent(t *testing.T, html string) {
+	t.Helper()
+	if strings.Contains(html, `localStorage.setItem(key,locale)`) {
+		t.Fatalf("expected English root landing page not to include locale bootstrap script")
+	}
+}
+
+func assertLandingLocaleBootstrap(t *testing.T, locale, html string) {
+	t.Helper()
+	if !strings.Contains(html, `var locale="`+locale+`"`) {
+		t.Fatalf("expected /%s/ landing page to bootstrap locale %q", locale, locale)
+	}
+	if !strings.Contains(html, `var key="scrumboy.locale"`) {
+		t.Fatalf("expected /%s/ landing page to use scrumboy.locale storage key", locale)
+	}
+	if !strings.Contains(html, `navigator.languages&&navigator.languages.length`) {
+		t.Fatalf("expected /%s/ landing page to guard on non-empty navigator.languages", locale)
+	}
+	if !strings.Contains(html, `.replace(/_/g,"-")`) {
+		t.Fatalf("expected /%s/ landing page to normalize all underscores in browser tags", locale)
+	}
+	if !strings.Contains(html, `lang.indexOf(locale+"-")===0`) {
+		t.Fatalf("expected /%s/ landing page to match regional browser language prefixes", locale)
+	}
+	if !strings.Contains(html, `if(localStorage.getItem(key))return`) {
+		t.Fatalf("expected /%s/ landing page to skip bootstrap when locale is already saved", locale)
+	}
+}
+
+func assertApexLandingNegotiationHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if got := resp.Header.Get("Cache-Control"); got != "private" {
+		t.Fatalf("expected Cache-Control private, got %q", got)
+	}
+	vary := resp.Header.Get("Vary")
+	for _, want := range []string{"Cookie", "Accept-Language"} {
+		if !headerListContains(vary, want) {
+			t.Fatalf("expected Vary to contain %s, got %q", want, vary)
+		}
+	}
+}
+
+func headerListContains(headerValue, want string) bool {
+	for _, part := range strings.Split(headerValue, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), want) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertRootLandingHreflangPolicy(t *testing.T, html string) {
@@ -1425,21 +1635,47 @@ func assertLandingDisplayCopy(t *testing.T, locale, html string) {
 		if !strings.Contains(html, "あなたのプロジェクト管理ツール、") || !strings.Contains(html, "これできますか？") {
 			t.Fatalf("expected /%s/ landing page to contain localized section title copy", locale)
 		}
-		if !strings.Contains(html, "ローカルで動かす") {
-			t.Fatalf("expected /%s/ landing page to contain localized deploy card title", locale)
+	} else if locale == "uk" {
+		if !strings.Contains(html, "Чи вміє ваш") || !strings.Contains(html, "інструмент керування проєктами") || !strings.Contains(html, "таке?") {
+			t.Fatalf("expected /%s/ landing page to contain localized section title copy", locale)
 		}
-		if !strings.Contains(html, "今すぐ作る") {
-			t.Fatalf("expected /%s/ landing page to contain localized anon card title", locale)
+	} else if locale == "zh" {
+		if !strings.Contains(html, "你的") || !strings.Contains(html, "项目管理工具") || !strings.Contains(html, "，能做到吗？") {
+			t.Fatalf("expected /%s/ landing page to contain localized section title copy", locale)
 		}
 	} else if !strings.Contains(html, "Kanban Boards") {
 		t.Fatalf("expected /%s/ landing page to contain English copy %q", locale, "Kanban Boards")
 	}
+
+	if cta, ok := landingCtaCardTitleByLocale[locale]; ok {
+		if !strings.Contains(html, cta.deploy) {
+			t.Fatalf("expected /%s/ landing page to contain localized deploy card title %q", locale, cta.deploy)
+		}
+		if !strings.Contains(html, cta.anon) {
+			t.Fatalf("expected /%s/ landing page to contain localized anon card title %q", locale, cta.anon)
+		}
+		if strings.Contains(html, "Deploy it locally.") {
+			t.Fatalf("expected /%s/ landing page not to contain English deploy card title", locale)
+		}
+		if strings.Contains(html, "Create a board now.") {
+			t.Fatalf("expected /%s/ landing page not to contain English anon card title", locale)
+		}
+	}
+
+	if description, ok := landingMetaDescriptionByLocale[locale]; ok {
+		if !strings.Contains(html, description) {
+			t.Fatalf("expected /%s/ landing page to contain localized meta description %q", locale, description)
+		}
+		if strings.Contains(html, landingMetaDescriptionEnglish) {
+			t.Fatalf("expected /%s/ landing page not to contain English meta description", locale)
+		}
+	}
+
 	englishCopy := []string{
 		"markdown + mermaid",
 		"Use Markdown and Mermaid diagrams in task notes",
 	}
-	if locale != "ja" {
-		englishCopy = append([]string{"Deploy it locally.", "Create a board now."}, englishCopy...)
+	if locale != "ja" && locale != "uk" && locale != "zh" {
 		englishCopy = append(englishCopy, "Can your", "project management tool")
 	}
 	for _, want := range englishCopy {
@@ -1449,6 +1685,61 @@ func assertLandingDisplayCopy(t *testing.T, locale, html string) {
 	}
 
 	assertLandingMultilingualFeatureText(t, locale, html)
+}
+
+const landingMetaDescriptionEnglish = "Scrumboy gives you self-hosted project boards or instant anonymous boards for quick collaboration."
+
+var landingMetaDescriptionByLocale = map[string]string{
+	"ar": "Scrumboy يوفّر لوحات مشاريع ذاتية الاستضافة، أو لوحات فورية بدون حساب للتعاون السريع.",
+	"bn": "Scrumboy দ্রুত সহযোগিতার জন্য নিজের সার্ভারে চালানো যায় এমন প্রোজেক্ট বোর্ড বা তাৎক্ষণিক অজ্ঞাতনামা বোর্ড প্রদান করে।",
+	"de": "Scrumboy bietet selbst gehostete Projektboards oder sofort verfügbare anonyme Boards für schnelle Zusammenarbeit.",
+	"es": "Scrumboy te ofrece tableros de proyecto autohospedados o tableros anónimos instantáneos para colaborar rápidamente.",
+	"fa": "Scrumboy برای همکاری سریع، بردهای پروژه با میزبانی شخصی یا بردهای ناشناس فوری در اختیارتان می‌گذارد.",
+	"fr": "Scrumboy propose des tableaux de projet auto-hébergés ou des tableaux anonymes instantanés pour collaborer rapidement.",
+	"hi": "Scrumboy तेज़ सहयोग के लिए अपने सर्वर पर चलने वाले प्रोजेक्ट बोर्ड या तुरंत बनाए जाने वाले गुमनाम बोर्ड उपलब्ध कराता है।",
+	"id": "Scrumboy menyediakan papan proyek yang di-host sendiri atau papan anonim instan untuk kolaborasi cepat.",
+	"it": "Scrumboy offre bacheche di progetto self-hosted o bacheche anonime istantanee per collaborare rapidamente.",
+	"ja": "Scrumboy は、セルフホスト型のプロジェクトボードと、すばやい共同作業向けの即席匿名ボードを提供します。",
+	"ko": "Scrumboy는 빠른 협업을 위한 셀프 호스팅 프로젝트 보드와 즉시 만들 수 있는 익명 보드를 제공합니다.",
+	"ms": "Scrumboy menyediakan papan projek yang dihos sendiri atau papan tanpa nama serta-merta untuk kerjasama pantas.",
+	"pl": "Scrumboy oferuje samodzielnie hostowane tablice projektów lub natychmiastowe anonimowe tablice do szybkiej współpracy.",
+	"pt": "O Scrumboy oferece quadros de projeto auto-hospedados ou quadros anônimos instantâneos para colaboração rápida.",
+	"ru": "Scrumboy предлагает самостоятельно размещаемые проектные доски или мгновенные анонимные доски для быстрой совместной работы.",
+	"sw": "Scrumboy hukupa bodi za miradi zinazojihifadhi mwenyewe au bodi za siri zinazoundwa papo hapo kwa ushirikiano wa haraka.",
+	"th": "Scrumboy ให้บอร์ดโปรเจกต์แบบ self-hosted หรือบอร์ดไม่ระบุตัวตนที่สร้างได้ทันทีสำหรับการทำงานร่วมกันอย่างรวดเร็ว",
+	"tr": "Scrumboy, hızlı iş birliği için kendi sunucunuzda barındırabileceğiniz proje panoları veya anında oluşturulan anonim panolar sunar.",
+	"uk": "Scrumboy надає проєктні дошки для власного хостингу або миттєві анонімні дошки для швидкої співпраці.",
+	"ur": "Scrumboy تیز تعاون کے لیے اپنے سرور پر چلنے والے پروجیکٹ بورڈز یا فوری گمنام بورڈز فراہم کرتا ہے۔",
+	"vi": "Scrumboy cung cấp bảng dự án tự lưu trữ hoặc bảng ẩn danh tức thì để cộng tác nhanh.",
+	"zh": "Scrumboy 提供自托管项目看板，或可即时创建的匿名看板，用于快速协作。",
+}
+
+var landingCtaCardTitleByLocale = map[string]struct {
+	deploy string
+	anon   string
+}{
+	"ar": {deploy: "شغّله على خادمك.", anon: "أنشئ لوحة الآن."},
+	"bn": {deploy: "নিজের সার্ভারে চালান।", anon: "এখনই বোর্ড বানান।"},
+	"de": {deploy: "Lokal bereitstellen.", anon: "Jetzt ein Board erstellen."},
+	"es": {deploy: "Despliega localmente.", anon: "Crea un tablero ahora."},
+	"fa": {deploy: "روی سرور خودتان اجرا کنید.", anon: "همین حالا یک برد بسازید."},
+	"fr": {deploy: "Déployez-le en local.", anon: "Créez un tableau maintenant."},
+	"hi": {deploy: "अपने सर्वर पर चलाएँ।", anon: "अभी बोर्ड बनाएं।"},
+	"id": {deploy: "Deploy secara lokal.", anon: "Buat board sekarang."},
+	"it": {deploy: "Distribuiscilo in locale.", anon: "Crea una bacheca ora."},
+	"ja": {deploy: "ローカルで動かす", anon: "今すぐ作る"},
+	"ko": {deploy: "로컬에 배포하세요.", anon: "지금 보드를 만드세요."},
+	"ms": {deploy: "Jalankan pada pelayan anda sendiri.", anon: "Cipta papan sekarang."},
+	"pl": {deploy: "Uruchom lokalnie.", anon: "Utwórz tablicę teraz."},
+	"pt": {deploy: "Faça o deploy localmente.", anon: "Crie um quadro agora."},
+	"ru": {deploy: "Разверните локально.", anon: "Создайте доску сейчас."},
+	"sw": {deploy: "Endesha kwenye seva yako mwenyewe.", anon: "Tengeneza bodi sasa."},
+	"th": {deploy: "รันบนเซิร์ฟเวอร์ของคุณ", anon: "สร้างบอร์ดตอนนี้"},
+	"tr": {deploy: "Yerel olarak dağıtın.", anon: "Hemen bir pano oluşturun."},
+	"uk": {deploy: "Розгорніть локально.", anon: "Створіть дошку зараз."},
+	"ur": {deploy: "اپنے سرور پر چلائیں۔", anon: "ابھی بورڈ بنائیں۔"},
+	"vi": {deploy: "Triển khai cục bộ.", anon: "Tạo bảng ngay."},
+	"zh": {deploy: "本地部署。", anon: "立即创建看板。"},
 }
 
 var landingMultilingualFeatureTextByLocale = map[string]string{
@@ -1502,10 +1793,10 @@ var landingLocalizedHeroTitleByLocale = map[string]struct {
 	"fr": {rest: "sans", line2: "complication"},
 	"hi": {rest: "बिना झंझट", line2: "के."},
 	"id": {rest: "tanpa", line2: "ribet"},
-	"ms": {rest: "tanpa", line2: "rumit"},
+	"ms": {rest: "tanpa", line2: "kerumitan."},
 	"it": {rest: "senza complicazioni"},
 	"pl": {rest: "bez", line2: "ceremonii."},
-	"uk": {rest: "без", line2: "церемоній."},
+	"uk": {rest: "без", line2: "мороки."},
 	"ja": {accent: "カンバン", rest: "を", line2: "シンプルに"},
 	"sw": {rest: "bila", line2: "mbwembwe."},
 	"ko": {rest: "더 쉽게"},
@@ -1516,7 +1807,7 @@ var landingLocalizedHeroTitleByLocale = map[string]struct {
 	"ur": {rest: "آسان اور", line2: "بےفکر۔"},
 	"fa": {rest: "بدون", line2: "تشریفات."},
 	"vi": {rest: "thật đơn", line2: "giản"},
-	"zh": {rest: "简单上手"},
+	"zh": {accent: "看板", rest: "简单上手"},
 }
 
 func assertLandingLocalizedHeroTitle(t *testing.T, locale, html string) {
@@ -1538,8 +1829,18 @@ func assertLandingLocalizedHeroTitle(t *testing.T, locale, html string) {
 		}
 	}
 	if want.line2 != "" {
-		if !strings.Contains(html, `<span class="title-line2">`+want.line2+`</span>`) {
-			t.Fatalf("expected /%s/ landing hero line2 %q", locale, want.line2)
+		switch locale {
+		case "ru":
+			if !strings.Contains(html, `<span class="title-line2">лишней</span>`) {
+				t.Fatalf("expected /%s/ landing hero line2 %q", locale, "лишней")
+			}
+			if !strings.Contains(html, `<span class="title-line3">сложности</span>`) {
+				t.Fatalf("expected /%s/ landing hero line3 %q", locale, "сложности")
+			}
+		default:
+			if !strings.Contains(html, `<span class="title-line2">`+want.line2+`</span>`) {
+				t.Fatalf("expected /%s/ landing hero line2 %q", locale, want.line2)
+			}
 		}
 	}
 	switch locale {
@@ -1568,10 +1869,56 @@ func assertLandingJapaneseHeroStyles(t *testing.T, locale, html string) {
 		`html[lang="ja"] .title-accent`,
 		`html[lang="ja"] .title-line2`,
 		"white-space: nowrap",
+		"overflow-wrap: normal",
 		"writing-mode: horizontal-tb",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("expected /ja/ landing page to include Japanese hero layout CSS %q", want)
+		}
+	}
+}
+
+func assertLandingChineseHeroStyles(t *testing.T, locale, html string) {
+	t.Helper()
+	marker := "zh landing hero: desktop two-line stack"
+	if locale != "zh" {
+		if strings.Contains(html, marker) {
+			t.Fatalf("expected /%s/ not to contain Chinese-only landing hero styles", locale)
+		}
+		return
+	}
+	for _, want := range []string{
+		marker,
+		`html[lang="zh-CN"] .title-accent`,
+		`html[lang="zh-CN"] .title-w-the`,
+		"white-space: nowrap",
+		"writing-mode: horizontal-tb",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected /zh/ landing page to include Chinese hero layout CSS %q", want)
+		}
+	}
+}
+
+func assertLandingRussianHeroStyles(t *testing.T, locale, html string) {
+	t.Helper()
+	marker := "ru landing hero: desktop line stack"
+	if locale != "ru" {
+		if strings.Contains(html, marker) {
+			t.Fatalf("expected /%s/ not to contain Russian-only landing hero styles", locale)
+		}
+		return
+	}
+	for _, want := range []string{
+		marker,
+		`<span class="title-line2">лишней</span>`,
+		`<span class="title-line3">сложности</span>`,
+		`html[lang="ru"] .title-line3`,
+		"white-space: nowrap",
+		"writing-mode: horizontal-tb",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected /ru/ landing page to include Russian hero layout %q", want)
 		}
 	}
 }
@@ -1584,7 +1931,6 @@ func assertLandingHeroLine2BreakStyles(t *testing.T, locale, html string) {
 		"fr": "fr landing hero: desktop-only line break before complication",
 		"es": "es landing hero: desktop-only line break before complicaciones",
 		"id": "id landing hero: desktop-only line break before ribet",
-		"ru": "ru landing hero: desktop-only line break before лишней сложности",
 		"th": "th landing hero: desktop-only line break before ไม่ยุ่งยาก",
 	}
 	htmlLangByLocale := map[string]string{
@@ -1593,7 +1939,6 @@ func assertLandingHeroLine2BreakStyles(t *testing.T, locale, html string) {
 		"fr": "fr",
 		"es": "es-MX",
 		"id": "id-ID",
-		"ru": "ru",
 		"th": "th-TH",
 	}
 	for loc, marker := range markersByLocale {
@@ -1896,6 +2241,9 @@ func TestAuth_EndpointsNotFound_AnonymousMode(t *testing.T) {
 	if statusResp["pushConfigured"] != false {
 		t.Fatalf("expected pushConfigured to be false in anonymous mode, got %v", statusResp["pushConfigured"])
 	}
+	if statusResp["selfServicePasswordResetEnabled"] != false {
+		t.Fatalf("expected selfServicePasswordResetEnabled to be false in anonymous mode, got %v", statusResp["selfServicePasswordResetEnabled"])
+	}
 }
 
 func TestAuthStatus_PushConfiguredCapability(t *testing.T) {
@@ -1950,55 +2298,346 @@ func TestAuthStatus_PushConfiguredCapability(t *testing.T) {
 	}
 }
 
-func TestClaimTemporaryBoard_FullMode(t *testing.T) {
+func TestAuthStatus_SelfServicePasswordResetCapability(t *testing.T) {
+	configured := Options{
+		MaxRequestBody: 1 << 20,
+		ScrumboyMode:   "full",
+		SMTPHost:       "smtp.example.com",
+		SMTPPort:       587,
+		SMTPFrom:       "no-reply@example.com",
+		EncryptionKey:  testEncryptionKey,
+		PublicBaseURL:  "https://scrumboy.example.com",
+	}
+	missingSMTPHost := configured
+	missingSMTPHost.SMTPHost = ""
+	invalidSMTPPort := configured
+	invalidSMTPPort.SMTPPort = 0
+	missingEncryptionKey := configured
+	missingEncryptionKey.EncryptionKey = nil
+	missingPublicBaseURL := configured
+	missingPublicBaseURL.PublicBaseURL = ""
+	invalidPublicBaseURL := configured
+	invalidPublicBaseURL.PublicBaseURL = "https://scrumboy.example.com/path"
+	emptyFrom := configured
+	emptyFrom.SMTPFrom = "   "
+	malformedFrom := configured
+	malformedFrom.SMTPFrom = "not-an-address"
+	crlfFrom := configured
+	crlfFrom.SMTPFrom = "no-reply@example.com\r\nBcc: evil@example.com"
+	displayNameFrom := configured
+	displayNameFrom.SMTPFrom = "Scrumboy <no-reply@example.com>"
+	anonymous := configured
+	anonymous.ScrumboyMode = "anonymous"
+
+	cases := []struct {
+		name string
+		opts Options
+		want bool
+	}{
+		{name: "full mode with every prerequisite", opts: configured, want: true},
+		{name: "missing SMTP host", opts: missingSMTPHost, want: false},
+		{name: "invalid SMTP port", opts: invalidSMTPPort, want: false},
+		{name: "missing encryption key", opts: missingEncryptionKey, want: false},
+		{name: "missing public base URL", opts: missingPublicBaseURL, want: false},
+		{name: "invalid public base URL", opts: invalidPublicBaseURL, want: false},
+		{name: "empty From", opts: emptyFrom, want: false},
+		{name: "malformed From", opts: malformedFrom, want: false},
+		{name: "CRLF From", opts: crlfFrom, want: false},
+		{name: "valid display-name From", opts: displayNameFrom, want: true},
+		{name: "anonymous mode with every prerequisite", opts: anonymous, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, _, cleanup := newTestHTTPServerWithOptions(t, tc.opts)
+			defer cleanup()
+
+			resp, err := ts.Client().Get(ts.URL + "/api/auth/status")
+			if err != nil {
+				t.Fatalf("GET /api/auth/status: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200 for /api/auth/status, got %d", resp.StatusCode)
+			}
+			var st map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+				t.Fatalf("decode status response: %v", err)
+			}
+			if st["selfServicePasswordResetEnabled"] != tc.want {
+				t.Fatalf("expected selfServicePasswordResetEnabled %v, got %#v", tc.want, st["selfServicePasswordResetEnabled"])
+			}
+		})
+	}
+}
+
+// claimTestProjectState reads the ownership-relevant columns for a project row.
+func claimTestProjectState(t *testing.T, sqlDB *sql.DB, projectID int64) (owner, creator, expires sql.NullInt64) {
+	t.Helper()
+	if err := sqlDB.QueryRow(
+		`SELECT owner_user_id, creator_user_id, expires_at FROM projects WHERE id = ?`, projectID,
+	).Scan(&owner, &creator, &expires); err != nil {
+		t.Fatalf("read project: %v", err)
+	}
+	return owner, creator, expires
+}
+
+// claimTestMemberRole returns the caller's project_members role, or "" if no row exists.
+func claimTestMemberRole(t *testing.T, sqlDB *sql.DB, projectID, userID int64) string {
+	t.Helper()
+	var role string
+	err := sqlDB.QueryRow(
+		`SELECT role FROM project_members WHERE project_id = ? AND user_id = ?`, projectID, userID,
+	).Scan(&role)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read membership: %v", err)
+	}
+	return role
+}
+
+// createAnonBoardViaHTTP hits the real GET /anon entrypoint using the given client and returns
+// the created board slug (parsed from the redirect Location). The client's authentication state
+// (its cookie jar) drives what the server records: signed in -> Temporary Board (creator set);
+// signed out, or Anonymous Mode which ignores auth -> Anonymous Board (creator NULL).
+func createAnonBoardViaHTTP(t *testing.T, client *http.Client, baseURL string) string {
+	t.Helper()
+	prev := client.CheckRedirect
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	defer func() { client.CheckRedirect = prev }()
+
+	resp, err := client.Get(baseURL + "/anon")
+	if err != nil {
+		t.Fatalf("GET /anon: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 from /anon, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	slug := strings.TrimPrefix(loc, "/")
+	if slug == "" || slug == loc || strings.Contains(slug, "/") {
+		t.Fatalf("expected /{slug} redirect from /anon, got %q", loc)
+	}
+	return slug
+}
+
+// projectIDBySlug resolves a slug to its numeric project id for direct DB assertions.
+func projectIDBySlug(t *testing.T, sqlDB *sql.DB, slug string) int64 {
+	t.Helper()
+	var id int64
+	if err := sqlDB.QueryRow(`SELECT id FROM projects WHERE slug = ?`, slug).Scan(&id); err != nil {
+		t.Fatalf("resolve project id for slug %q: %v", slug, err)
+	}
+	return id
+}
+
+// TestClaimTemporaryBoard_AnonymousMode_RouteUnavailable exercises the real /anon route in
+// Anonymous Mode: it creates an Anonymous Board (no creator), and the claim route is disabled.
+func TestClaimTemporaryBoard_AnonymousMode_RouteUnavailable(t *testing.T) {
+	ts, sqlDB, cleanup := newTestHTTPServer(t, "anonymous")
+	defer cleanup()
+
+	// Anonymous Mode ignores authentication entirely; do not model a claimable user here.
+	client := newCookieClient(t)
+	slug := createAnonBoardViaHTTP(t, client, ts.URL)
+
+	projectID := projectIDBySlug(t, sqlDB, slug)
+	_, creator, expires := claimTestProjectState(t, sqlDB, projectID)
+	if creator.Valid {
+		t.Fatalf("expected Anonymous Board (creator_user_id NULL), got %+v", creator)
+	}
+	if !expires.Valid {
+		t.Fatalf("expected an expiring board (expires_at set)")
+	}
+
+	// The claim route must remain unavailable in Anonymous Mode.
+	resp, _ := doJSON(t, client, http.MethodPost, ts.URL+"/api/board/"+slug+"/claim", map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for claim in Anonymous Mode, got %d", resp.StatusCode)
+	}
+
+	owner, _, expires2 := claimTestProjectState(t, sqlDB, projectID)
+	if owner.Valid || !expires2.Valid {
+		t.Fatalf("expected board unchanged (unowned, expiring), got owner=%+v expires=%+v", owner, expires2)
+	}
+}
+
+// TestClaimTemporaryBoard_FullMode_SignedOut_AnonymousBoardNotClaimable proves that a board
+// created through /anon while signed out on a Full Mode instance is an Anonymous Board and
+// stays unclaimable even after the caller authenticates.
+func TestClaimTemporaryBoard_FullMode_SignedOut_AnonymousBoardNotClaimable(t *testing.T) {
 	ts, sqlDB, cleanup := newTestHTTPServer(t, "full")
 	defer cleanup()
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookie jar: %v", err)
-	}
-	client := &http.Client{Jar: jar}
+	// A real user exists (auth enabled, and used to attempt the claim later)...
+	alice := newCookieClient(t)
+	aliceUser := bootstrapUserClient(t, alice, ts.URL, "Alice", "alice@example.com", "password123")
+	aliceID := int64(aliceUser["id"].(float64))
 
-	// Bootstrap user (sets cookie)
-	var u map[string]any
-	resp, _ := doJSON(t, client, http.MethodPost, ts.URL+"/api/auth/bootstrap", map[string]any{
-		"name":     "Alice",
-		"email":    "admin@example.com",
+	// ...but the board is created via /anon while SIGNED OUT -> Anonymous Board (no creator).
+	anon := newCookieClient(t)
+	slug := createAnonBoardViaHTTP(t, anon, ts.URL)
+
+	projectID := projectIDBySlug(t, sqlDB, slug)
+	if _, creator, expires := claimTestProjectState(t, sqlDB, projectID); creator.Valid || !expires.Valid {
+		t.Fatalf("expected Anonymous Board (creator NULL, expiring), got creator=%+v expires=%+v", creator, expires)
+	}
+
+	// Authenticated Alice cannot claim an Anonymous Board.
+	resp, _ := doJSON(t, alice, http.MethodPost, ts.URL+"/api/board/"+slug+"/claim", map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 claiming Anonymous Board, got %d", resp.StatusCode)
+	}
+
+	owner, creator, expires := claimTestProjectState(t, sqlDB, projectID)
+	if owner.Valid {
+		t.Fatalf("expected owner_user_id still NULL, got %+v", owner)
+	}
+	if creator.Valid {
+		t.Fatalf("expected creator_user_id still NULL, got %+v", creator)
+	}
+	if !expires.Valid {
+		t.Fatalf("expected expires_at still set, got NULL")
+	}
+	if role := claimTestMemberRole(t, sqlDB, projectID, aliceID); role != "" {
+		t.Fatalf("expected no membership for the claimant, got %q", role)
+	}
+}
+
+// TestClaimTemporaryBoard_FullMode_SignedIn_Lifecycle is the primary security regression for
+// GHSA-vph4-pmmh-ch6x. It reproduces the real HTTP creation and sharing flow: Alice creates a
+// Temporary Board through /anon while signed in, Bob (an unrelated authenticated user with the
+// link) can read it while temporary but cannot claim it, Alice claims it into a Durable Project,
+// and the post-claim slug contract holds (slug retained, public capability removed).
+func TestClaimTemporaryBoard_FullMode_SignedIn_Lifecycle(t *testing.T) {
+	ts, sqlDB, cleanup := newTestHTTPServer(t, "full")
+	defer cleanup()
+
+	// Alice (owner) plus a second, unrelated real account for Bob.
+	alice := newCookieClient(t)
+	aliceUser := bootstrapUserClient(t, alice, ts.URL, "Alice", "alice@example.com", "password123")
+	aliceID := int64(aliceUser["id"].(float64))
+
+	var bobUser map[string]any
+	resp, body := doJSON(t, alice, http.MethodPost, ts.URL+"/api/admin/users", map[string]any{
+		"name":     "Bob",
+		"email":    "bob@example.com",
 		"password": "password123",
-	}, &u)
+	}, &bobUser)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 201, got %d", resp.StatusCode)
+		t.Fatalf("create Bob: expected 201, got %d body=%s", resp.StatusCode, string(body))
 	}
-	userID := int64(u["id"].(float64))
+	bobID := int64(bobUser["id"].(float64))
 
-	// Create a temporary board directly in DB (matches /anon semantics).
-	st := store.New(sqlDB, nil)
-	p, err := st.CreateAnonymousBoard(context.Background())
-	if err != nil {
-		t.Fatalf("CreateAnonymousBoard: %v", err)
-	}
-	if p.ExpiresAt == nil {
-		t.Fatalf("expected temp board expiresAt")
+	bob := newCookieClient(t)
+	loginUserClient(t, bob, ts.URL, "bob@example.com", "password123")
+
+	// Alice creates a board through the REAL /anon route while signed in -> Temporary Board.
+	slug := createAnonBoardViaHTTP(t, alice, ts.URL)
+	projectID := projectIDBySlug(t, sqlDB, slug)
+	if _, creator, expires := claimTestProjectState(t, sqlDB, projectID); !creator.Valid || creator.Int64 != aliceID || !expires.Valid {
+		t.Fatalf("expected Temporary Board created by Alice, got creator=%+v expires=%+v", creator, expires)
 	}
 
-	// Claim it via API.
-	resp, _ = doJSON(t, client, http.MethodPost, ts.URL+"/api/board/"+p.Slug+"/claim", map[string]any{}, nil)
+	// While temporary the slug is link-shareable: Bob can load it.
+	resp, _ = doJSON(t, bob, http.MethodGet, ts.URL+"/api/board/"+slug, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected Bob to load the temporary board (200), got %d", resp.StatusCode)
+	}
+
+	// But Bob cannot claim it.
+	resp, _ = doJSON(t, bob, http.MethodPost, ts.URL+"/api/board/"+slug+"/claim", map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for Bob's claim, got %d", resp.StatusCode)
+	}
+	if owner, creator, expires := claimTestProjectState(t, sqlDB, projectID); owner.Valid || !expires.Valid || !creator.Valid || creator.Int64 != aliceID {
+		t.Fatalf("expected board unchanged after Bob's claim, got owner=%+v creator=%+v expires=%+v", owner, creator, expires)
+	}
+	if role := claimTestMemberRole(t, sqlDB, projectID, bobID); role != "" {
+		t.Fatalf("expected Bob to have no membership, got %q", role)
+	}
+
+	// Alice can still load her temporary board.
+	resp, _ = doJSON(t, alice, http.MethodGet, ts.URL+"/api/board/"+slug, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected Alice to load her temporary board (200), got %d", resp.StatusCode)
+	}
+
+	// Alice (the recorded creator) claims it -> Durable Project.
+	resp, body = doJSON(t, alice, http.MethodPost, ts.URL+"/api/board/"+slug+"/claim", map[string]any{}, nil)
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", resp.StatusCode)
+		t.Fatalf("expected 204 for Alice's claim, got %d body=%s", resp.StatusCode, string(body))
 	}
-
-	// Verify DB updated: expires_at NULL and owner_user_id set.
-	var owner sql.NullInt64
-	var expires sql.NullInt64
-	if err := sqlDB.QueryRow(`SELECT owner_user_id, expires_at FROM projects WHERE id = ?`, p.ID).Scan(&owner, &expires); err != nil {
-		t.Fatalf("read project: %v", err)
-	}
-	if !owner.Valid || owner.Int64 != userID {
-		t.Fatalf("expected owner_user_id=%d, got %+v", userID, owner)
+	owner, creator, expires := claimTestProjectState(t, sqlDB, projectID)
+	if !owner.Valid || owner.Int64 != aliceID {
+		t.Fatalf("expected owner_user_id=%d, got %+v", aliceID, owner)
 	}
 	if expires.Valid {
 		t.Fatalf("expected expires_at NULL after claim")
+	}
+	if !creator.Valid || creator.Int64 != aliceID {
+		t.Fatalf("expected creator_user_id preserved as %d, got %+v", aliceID, creator)
+	}
+	if role := claimTestMemberRole(t, sqlDB, projectID, aliceID); role != "maintainer" {
+		t.Fatalf("expected Alice maintainer membership, got %q", role)
+	}
+
+	// Post-claim slug contract: same slug retained, but public capability removed.
+	// Owner can still load it using the same slug.
+	resp, _ = doJSON(t, alice, http.MethodGet, ts.URL+"/api/board/"+slug, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected Alice to load the durable project (200), got %d", resp.StatusCode)
+	}
+	// Unrelated authenticated user (Bob) can no longer load it.
+	resp, _ = doJSON(t, bob, http.MethodGet, ts.URL+"/api/board/"+slug, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for Bob loading the durable project, got %d", resp.StatusCode)
+	}
+	// Unauthenticated caller can no longer load it.
+	resp, _ = doJSON(t, &http.Client{}, http.MethodGet, ts.URL+"/api/board/"+slug, nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unauthenticated load of the durable project, got %d", resp.StatusCode)
+	}
+	// Repeating the claim is no longer recognized.
+	resp, _ = doJSON(t, alice, http.MethodPost, ts.URL+"/api/board/"+slug+"/claim", map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 on repeat claim, got %d", resp.StatusCode)
+	}
+}
+
+// TestClaimTemporaryBoard_ExpiredNotClaimable verifies an expired temporary board cannot be
+// claimed even by its creator.
+func TestClaimTemporaryBoard_ExpiredNotClaimable(t *testing.T) {
+	ts, sqlDB, cleanup := newTestHTTPServer(t, "full")
+	defer cleanup()
+
+	alice := newCookieClient(t)
+	aliceUser := bootstrapUserClient(t, alice, ts.URL, "Alice", "alice@example.com", "password123")
+	aliceID := int64(aliceUser["id"].(float64))
+
+	st := store.New(sqlDB, nil)
+	p, err := st.CreateAnonymousBoard(store.WithUserID(context.Background(), aliceID))
+	if err != nil {
+		t.Fatalf("CreateAnonymousBoard: %v", err)
+	}
+
+	// Force the board past its expiry.
+	pastMs := time.Now().UTC().Add(-time.Hour).UnixMilli()
+	if _, err := sqlDB.Exec(`UPDATE projects SET expires_at = ? WHERE id = ?`, pastMs, p.ID); err != nil {
+		t.Fatalf("expire board: %v", err)
+	}
+
+	resp, _ := doJSON(t, alice, http.MethodPost, ts.URL+"/api/board/"+p.Slug+"/claim", map[string]any{}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 claiming expired board, got %d", resp.StatusCode)
+	}
+
+	owner, _, _ := claimTestProjectState(t, sqlDB, p.ID)
+	if owner.Valid {
+		t.Fatalf("expected owner_user_id still NULL after expired claim, got %+v", owner)
 	}
 }
 
@@ -2006,14 +2645,18 @@ func TestClaimTemporaryBoard_Unauthorized(t *testing.T) {
 	ts, sqlDB, cleanup := newTestHTTPServer(t, "full")
 	defer cleanup()
 
-	// Create temp board.
+	// Seed a user so auth is enabled, then create a creator-owned temporary board.
+	alice := newCookieClient(t)
+	aliceUser := bootstrapUserClient(t, alice, ts.URL, "Alice", "alice@example.com", "password123")
+	aliceID := int64(aliceUser["id"].(float64))
+
 	st := store.New(sqlDB, nil)
-	p, err := st.CreateAnonymousBoard(context.Background())
+	p, err := st.CreateAnonymousBoard(store.WithUserID(context.Background(), aliceID))
 	if err != nil {
 		t.Fatalf("CreateAnonymousBoard: %v", err)
 	}
 
-	// No cookie -> 401
+	// No cookie -> 401 (auth gate runs before store authorization).
 	client := &http.Client{}
 	resp, _ := doJSON(t, client, http.MethodPost, ts.URL+"/api/board/"+p.Slug+"/claim", map[string]any{}, nil)
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -4000,6 +4643,7 @@ func TestBoardEvents_TodoMutationRefreshReasons(t *testing.T) {
 		name           string
 		trigger        func(t *testing.T, client *http.Client, baseURL, slug string, localID int64)
 		expectedReason string
+		assertSingle   bool
 	}{
 		{
 			name: "move",
@@ -4013,6 +4657,7 @@ func TestBoardEvents_TodoMutationRefreshReasons(t *testing.T) {
 				}
 			},
 			expectedReason: "todo_moved",
+			assertSingle:   true,
 		},
 		{
 			name: "delete",
@@ -4079,6 +4724,20 @@ func TestBoardEvents_TodoMutationRefreshReasons(t *testing.T) {
 				t.Fatalf("error reading sse event: %v", err)
 			case <-time.After(5 * time.Second):
 				t.Fatalf("timed out waiting for %s refresh event", tc.name)
+			}
+
+			if tc.assertSingle {
+				// The completed move response is the publication barrier: all
+				// synchronous refresh publishers have returned. Keep reading the
+				// live SSE stream briefly so duplicate route + application
+				// publication cannot hide behind the first expected event.
+				select {
+				case event := <-eventsCh:
+					t.Fatalf("expected exactly one non-ping move event, got an additional event: %+v", event)
+				case err := <-errCh:
+					t.Fatalf("board event stream ended while checking move cardinality: %v", err)
+				case <-time.After(250 * time.Millisecond):
+				}
 			}
 		})
 	}

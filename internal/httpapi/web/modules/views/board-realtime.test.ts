@@ -14,6 +14,9 @@ const {
     tag: "bug",
     search: "login",
     sprintId: "7",
+    assignee: null as string | null,
+    sort: null as string | null,
+    priority: null as string | null,
     authStatusAvailable: false,
     user: null as { id: number } | null,
     projectId: null as number | null,
@@ -30,6 +33,9 @@ vi.mock("../utils.js", () => ({
 }));
 
 vi.mock("../state/selectors.js", () => ({
+  getAssigneeFromUrl: () => selectorState.assignee,
+  getSortFromUrl: () => selectorState.sort ?? null,
+  getPriorityFromUrl: () => selectorState.priority ?? null,
   getAuthStatusAvailable: () => selectorState.authStatusAvailable,
   getProjectId: () => selectorState.projectId,
   getSlug: () => selectorState.slug,
@@ -108,6 +114,9 @@ describe("board-realtime drag refresh guards", () => {
     selectorState.tag = "bug";
     selectorState.search = "login";
     selectorState.sprintId = "7";
+    selectorState.assignee = null;
+    selectorState.sort = null;
+    selectorState.priority = null;
     selectorState.authStatusAvailable = false;
     selectorState.user = null;
     selectorState.projectId = null;
@@ -136,6 +145,7 @@ describe("board-realtime drag refresh guards", () => {
   it("flushes a queued refresh exactly once after drag ends", async () => {
     const mod = await loadBoardRealtimeModule();
     dragState.value = true;
+    selectorState.priority = "deleted";
 
     mod.__queuePendingRealtimeRefreshForTest("alpha");
     vi.advanceTimersByTime(mod.__getMaxRefreshDelayMsForTest() + 500);
@@ -145,7 +155,7 @@ describe("board-realtime drag refresh guards", () => {
     vi.advanceTimersByTime(mod.__getRealtimeRefreshDebounceMsForTest() + 5);
 
     expect(invalidateBoardMock).toHaveBeenCalledTimes(1);
-    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7");
+    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7", null, null, "deleted");
     expect(mod.__getPendingRealtimeRefreshSlugForTest()).toBeNull();
 
     vi.advanceTimersByTime(mod.__getMaxRefreshDelayMsForTest());
@@ -185,7 +195,7 @@ describe("board-realtime drag refresh guards", () => {
 
     vi.advanceTimersByTime(2);
     expect(invalidateBoardMock).toHaveBeenCalledTimes(1);
-    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7");
+    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7", null, null, null);
   });
 
   it("preserves the old force-flush behavior for non-drag guards", async () => {
@@ -198,6 +208,47 @@ describe("board-realtime drag refresh guards", () => {
 
     vi.advanceTimersByTime(20);
     expect(invalidateBoardMock).toHaveBeenCalledTimes(1);
-    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7");
+    expect(invalidateBoardMock).toHaveBeenCalledWith("alpha", "bug", "login", "7", null, null, null);
+  });
+
+  it("cancels a filter-complete realtime recovery when a manual board load starts", async () => {
+    const mod = await loadBoardRealtimeModule();
+    selectorState.assignee = "42";
+    selectorState.sort = "newest";
+    selectorState.priority = "high";
+    guardState.lastLocalMutationTimestamp = Date.now();
+    guardState.lastBoardInteractionTimestamp = Date.now();
+
+    mod.__queuePendingRealtimeRefreshForTest("alpha");
+    expect(mod.__getPendingRealtimeRefreshSlugForTest()).toBe("alpha");
+
+    mod.clearPendingRealtimeRefresh();
+    vi.advanceTimersByTime(mod.__getMaxRefreshDelayMsForTest() + 500);
+
+    expect(mod.__getPendingRealtimeRefreshSlugForTest()).toBeNull();
+    expect(invalidateBoardMock).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a private creator activity toast into a board refresh", async () => {
+    const mod = await loadBoardRealtimeModule();
+    selectorState.authStatusAvailable = true;
+    selectorState.user = { id: 11 };
+    selectorState.projectId = 7;
+    mod.connectBoardEvents("alpha");
+
+    mod.__handleBoardRealtimeEventForTest({
+      type: "todo.creator_activity",
+      projectId: 7,
+      projectSlug: "alpha",
+      payload: {
+        todoId: 81,
+        localId: 5,
+        title: "Committed title",
+        activityReason: "todo_updated",
+      },
+    });
+    vi.advanceTimersByTime(mod.__getMaxRefreshDelayMsForTest() + 100);
+
+    expect(invalidateBoardMock).not.toHaveBeenCalled();
   });
 });

@@ -10,7 +10,39 @@ import (
 func tagsToJSON(tags []store.TagWithColor) []tagWithColorJSON {
 	out := make([]tagWithColorJSON, 0, len(tags))
 	for _, t := range tags {
-		out = append(out, tagWithColorJSON{TagID: t.TagID, Name: t.Name, Color: t.Color, CanDelete: t.CanDelete})
+		scope := "none"
+		if t.CanDelete {
+			scope = "mine"
+		}
+		// Personal-library rows (GET /api/tags/mine and board autocomplete) are always
+		// color-editable by their owner; CanUpdateColor must be set explicitly because
+		// the field is a non-omitempty bool (zero value would disable every picker).
+		out = append(out, tagWithColorJSON{
+			TagID:          t.TagID,
+			Name:           t.Name,
+			Color:          t.Color,
+			DeleteScope:    scope,
+			CanDelete:      t.CanDelete,
+			CanUpdateColor: true,
+		})
+	}
+	return out
+}
+
+// tagCountsToJSON projects grouped project tags (name-based) for the tag-list
+// endpoints. deleteScope is authoritative; canDelete is a compatibility alias.
+func tagCountsToJSON(tags []store.TagCount) []tagWithColorJSON {
+	out := make([]tagWithColorJSON, 0, len(tags))
+	for _, tc := range tags {
+		scope := tc.DeleteScope()
+		out = append(out, tagWithColorJSON{
+			TagID:          tc.TagID,
+			Name:           tc.Name,
+			Color:          tc.Color,
+			DeleteScope:    scope,
+			CanDelete:      scope != "none",
+			CanUpdateColor: tc.CanUpdateColor,
+		})
 	}
 	return out
 }
@@ -107,6 +139,7 @@ type projectJSON struct {
 	Image              *string    `json:"image,omitempty"`
 	DominantColor      string     `json:"dominantColor"`
 	DefaultSprintWeeks int        `json:"defaultSprintWeeks"`
+	SprintsEnabled     bool       `json:"sprintsEnabled"`
 	ExpiresAt          *time.Time `json:"expiresAt"`
 	CreatorUserID      *int64     `json:"creatorUserId,omitempty"`
 	Slug               string     `json:"slug"`
@@ -124,6 +157,8 @@ type userJSON struct {
 	SystemRole       string    `json:"systemRole"`
 	CreatedAt        time.Time `json:"createdAt"`
 	TwoFactorEnabled bool      `json:"twoFactorEnabled"`
+	HasLocalPassword bool      `json:"hasLocalPassword"`
+	OIDCLinked       bool      `json:"oidcLinked"`
 }
 
 // userStatusJSON omits createdAt for /api/auth/status (status response contract).
@@ -135,6 +170,8 @@ func userStatusJSON(u store.User) map[string]any {
 		"isBootstrap":      u.IsBootstrap,
 		"systemRole":       u.SystemRole.String(),
 		"twoFactorEnabled": u.IsTwoFactorActive(),
+		"hasLocalPassword": u.HasLocalPassword,
+		"oidcLinked":       u.OIDCLinked,
 	}
 }
 
@@ -148,6 +185,8 @@ func userToJSON(u store.User) userJSON {
 		SystemRole:       u.SystemRole.String(),
 		CreatedAt:        u.CreatedAt,
 		TwoFactorEnabled: u.IsTwoFactorActive(),
+		HasLocalPassword: u.HasLocalPassword,
+		OIDCLinked:       u.OIDCLinked,
 	}
 }
 
@@ -213,6 +252,7 @@ func projectToJSON(p store.Project) projectJSON {
 		Image:              p.Image,
 		DominantColor:      p.DominantColor,
 		DefaultSprintWeeks: p.DefaultSprintWeeks,
+		SprintsEnabled:     p.SprintsEnabled,
 		ExpiresAt:          p.ExpiresAt,
 		CreatorUserID:      p.CreatorUserID,
 		Slug:               p.Slug,
@@ -246,7 +286,9 @@ type todoJSON struct {
 	Rank             int64      `json:"rank"`
 	EstimationPoints *int64     `json:"estimationPoints,omitempty"`
 	AssigneeUserId   *int64     `json:"assigneeUserId,omitempty"`
+	CreatedByUserId  *int64     `json:"createdByUserId,omitempty"`
 	SprintId         *int64     `json:"sprintId,omitempty"`
+	PriorityKey      *string    `json:"priorityKey,omitempty"`
 	Tags             []string   `json:"tags"`
 	CreatedAt        time.Time  `json:"createdAt"`
 	UpdatedAt        time.Time  `json:"updatedAt"`
@@ -265,12 +307,21 @@ func todoToJSON(t store.Todo) todoJSON {
 		Rank:             t.Rank,
 		EstimationPoints: t.EstimationPoints,
 		AssigneeUserId:   t.AssigneeUserID,
+		CreatedByUserId:  t.CreatedByUserID,
 		SprintId:         t.SprintID,
+		PriorityKey:      t.PriorityKey,
 		Tags:             t.Tags,
 		CreatedAt:        t.CreatedAt,
 		UpdatedAt:        t.UpdatedAt,
 		DoneAt:           t.DoneAt,
 	}
+}
+
+func todoToJSONForProject(t store.Todo, project store.Project) todoJSON {
+	if !project.SprintsEnabled {
+		t.SprintID = nil
+	}
+	return todoToJSON(t)
 }
 
 type activeSprintInfoJSON struct {
@@ -352,6 +403,7 @@ type dashboardTodoJSON struct {
 	ProjectDominantColor string    `json:"projectDominantColor"`
 	EstimationPoints     *int64    `json:"estimationPoints,omitempty"`
 	SprintId             *int64    `json:"sprintId,omitempty"`
+	PriorityKey          *string   `json:"priorityKey,omitempty"`
 	Status               string    `json:"status"`
 	StatusName           string    `json:"statusName"`
 	StatusColor          string    `json:"statusColor"`
@@ -460,6 +512,7 @@ func dashboardTodoToJSON(t store.DashboardTodo) dashboardTodoJSON {
 		ProjectDominantColor: t.ProjectDominantColor,
 		EstimationPoints:     t.EstimationPoints,
 		SprintId:             t.SprintID,
+		PriorityKey:          t.PriorityKey,
 		Status:               strings.ToUpper(t.ColumnKey),
 		StatusName:           t.StatusName,
 		StatusColor:          t.StatusColor,
@@ -480,18 +533,32 @@ func dashboardTodosToJSON(items []store.DashboardTodo, nextCursor *string) dashb
 }
 
 type tagCountJSON struct {
-	TagID     int64   `json:"tagId"`
-	Name      string  `json:"name"`
-	Count     int     `json:"count"`
-	Color     *string `json:"color,omitempty"`
-	CanDelete bool    `json:"canDelete"`
+	// TagID is omitted for grouped personal labels (no representative row).
+	TagID int64   `json:"tagId,omitempty"`
+	Name  string  `json:"name"`
+	Count int     `json:"count"`
+	Color *string `json:"color,omitempty"`
+	// DeleteScope is one of "mine", "project", "none". canDelete is a
+	// compatibility alias equal to deleteScope != "none".
+	DeleteScope string `json:"deleteScope"`
+	CanDelete   bool   `json:"canDelete"`
+	// CanUpdateColor is false for durable board-scoped tags when the viewer is
+	// below Maintainer (shared tags.color). Personal labels and temporary-board
+	// rows report true when the viewer may change the color.
+	CanUpdateColor bool `json:"canUpdateColor"`
 }
 
 type tagWithColorJSON struct {
-	TagID     int64   `json:"tagId"`
-	Name      string  `json:"name"`
-	Color     *string `json:"color,omitempty"`
-	CanDelete bool    `json:"canDelete"`
+	// TagID is omitted for grouped personal labels (no representative row).
+	TagID int64   `json:"tagId,omitempty"`
+	Name  string  `json:"name"`
+	Color *string `json:"color,omitempty"`
+	// DeleteScope is one of "mine", "project", "none". canDelete is a
+	// compatibility alias equal to deleteScope != "none".
+	DeleteScope string `json:"deleteScope"`
+	CanDelete   bool   `json:"canDelete"`
+	// CanUpdateColor gates the Settings → Tag Colors picker for this entry.
+	CanUpdateColor bool `json:"canUpdateColor"`
 }
 
 type columnMetaJSON struct {
@@ -500,12 +567,38 @@ type columnMetaJSON struct {
 	TotalCount int     `json:"totalCount"` // total todos in lane (with same filters)
 }
 
+type agendaEventJSON struct {
+	ID           string `json:"id"`
+	SourceID     int64  `json:"sourceId"`
+	CalendarName string `json:"calendarName"`
+	Title        string `json:"title"`
+	StartsAt     string `json:"startsAt"`
+	EndsAt       string `json:"endsAt"`
+	AllDay       bool   `json:"allDay"`
+	Location     string `json:"location"`
+	Provider     string `json:"provider"`
+	HostKind     string `json:"hostKind"`
+}
+
+type agendaJSON struct {
+	Enabled   bool              `json:"enabled"`
+	Timezone  string            `json:"timezone,omitempty"`
+	Title     string            `json:"title,omitempty"`
+	Color     string            `json:"color,omitempty"`
+	Stale     bool              `json:"stale,omitempty"`
+	FetchedAt *string           `json:"fetchedAt,omitempty"`
+	Error     *string           `json:"error,omitempty"`
+	Events    []agendaEventJSON `json:"events,omitempty"`
+}
+
 type boardJSON struct {
-	Project     projectJSON               `json:"project"`
-	ColumnOrder []workflowColumnJSON      `json:"columnOrder"`
-	Tags        []tagCountJSON            `json:"tags"`
-	Columns     map[string][]todoJSON     `json:"columns"`
-	ColumnsMeta map[string]columnMetaJSON `json:"columnsMeta,omitempty"`
+	Project       projectJSON               `json:"project"`
+	ColumnOrder   []workflowColumnJSON      `json:"columnOrder"`
+	PriorityOrder []priorityTierJSON        `json:"priorityOrder"`
+	Tags          []tagCountJSON            `json:"tags"`
+	Columns       map[string][]todoJSON     `json:"columns"`
+	ColumnsMeta   map[string]columnMetaJSON `json:"columnsMeta,omitempty"`
+	Agenda        *agendaJSON               `json:"agenda,omitempty"`
 }
 
 type lanePageJSON struct {
@@ -541,24 +634,53 @@ type workflowLaneCountsJSON struct {
 	CountsByColumnKey map[string]int `json:"countsByColumnKey"`
 }
 
-func boardToJSON(p store.Project, workflow []store.WorkflowColumn, tags []store.TagCount, cols map[string][]store.Todo) boardJSON {
-	return boardToJSONWithMeta(p, workflow, tags, cols, nil)
+type priorityTierJSON struct {
+	Key      string `json:"key"`
+	Name     string `json:"name"`
+	Color    string `json:"color"`
+	Position int    `json:"position"`
 }
 
-func boardToJSONWithMeta(p store.Project, workflow []store.WorkflowColumn, tags []store.TagCount, cols map[string][]store.Todo, meta map[string]store.LaneMeta) boardJSON {
+// priorityTierCountsJSON is the body for GET /api/board/{slug}/priorities/counts.
+// Priority tiers with zero todos may be omitted from countsByPriorityKey; clients treat a missing key as 0.
+type priorityTierCountsJSON struct {
+	Slug                string         `json:"slug"`
+	CountsByPriorityKey map[string]int `json:"countsByPriorityKey"`
+}
+
+func boardToJSON(p store.Project, workflow []store.WorkflowColumn, priorities []store.PriorityTier, tags []store.TagCount, cols map[string][]store.Todo) boardJSON {
+	return boardToJSONWithMeta(p, workflow, priorities, tags, cols, nil)
+}
+
+func boardToJSONWithMeta(p store.Project, workflow []store.WorkflowColumn, priorities []store.PriorityTier, tags []store.TagCount, cols map[string][]store.Todo, meta map[string]store.LaneMeta) boardJSON {
 	out := boardJSON{
-		Project:     projectToJSON(p),
-		ColumnOrder: make([]workflowColumnJSON, 0, len(workflow)),
-		Tags:        make([]tagCountJSON, 0, len(tags)),
-		Columns:     map[string][]todoJSON{},
+		Project:       projectToJSON(p),
+		ColumnOrder:   make([]workflowColumnJSON, 0, len(workflow)),
+		PriorityOrder: make([]priorityTierJSON, 0, len(priorities)),
+		Tags:          make([]tagCountJSON, 0, len(tags)),
+		Columns:       map[string][]todoJSON{},
 	}
 	for _, wc := range workflow {
 		out.ColumnOrder = append(out.ColumnOrder, workflowColumnJSON{
 			Key: wc.Key, Name: wc.Name, Color: wc.Color, IsDone: wc.IsDone, Position: wc.Position,
 		})
 	}
+	for _, pt := range priorities {
+		out.PriorityOrder = append(out.PriorityOrder, priorityTierJSON{
+			Key: pt.Key, Name: pt.Name, Color: pt.Color, Position: pt.Position,
+		})
+	}
 	for _, tc := range tags {
-		out.Tags = append(out.Tags, tagCountJSON{TagID: tc.TagID, Name: tc.Name, Count: tc.Count, Color: tc.Color, CanDelete: tc.CanDelete})
+		scope := tc.DeleteScope()
+		out.Tags = append(out.Tags, tagCountJSON{
+			TagID:          tc.TagID,
+			Name:           tc.Name,
+			Count:          tc.Count,
+			Color:          tc.Color,
+			DeleteScope:    scope,
+			CanDelete:      scope != "none",
+			CanUpdateColor: tc.CanUpdateColor,
+		})
 	}
 	for key, todos := range cols {
 		outTodos := make([]todoJSON, 0, len(todos))
@@ -643,17 +765,23 @@ type exportDataJSON struct {
 
 // projectExportJSON: EstimationMode is exported for backup readability; on import the server ignores it and uses store.EstimationModeModifiedFibonacci (v1).
 type projectExportJSON struct {
-	Slug           string           `json:"slug"`
-	Name           string           `json:"name"`
-	EstimationMode string           `json:"estimationMode,omitempty"`
-	Image          *string          `json:"image,omitempty"`
-	DominantColor  string           `json:"dominantColor,omitempty"`
-	ExpiresAt      *time.Time       `json:"expiresAt"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	UpdatedAt      time.Time        `json:"updatedAt"`
-	Todos          []todoExportJSON `json:"todos"`
-	Tags           []tagExportJSON  `json:"tags"`
-	Links          []linkExportJSON `json:"links,omitempty"`
+	Slug               string                       `json:"slug"`
+	Name               string                       `json:"name"`
+	EstimationMode     string                       `json:"estimationMode,omitempty"`
+	Image              *string                      `json:"image,omitempty"`
+	DominantColor      string                       `json:"dominantColor,omitempty"`
+	DefaultSprintWeeks int                          `json:"defaultSprintWeeks,omitempty"`
+	SprintsEnabled     *bool                        `json:"sprintsEnabled,omitempty"`
+	ExpiresAt          *time.Time                   `json:"expiresAt"`
+	CreatedAt          time.Time                    `json:"createdAt"`
+	UpdatedAt          time.Time                    `json:"updatedAt"`
+	WorkflowColumns    []store.WorkflowColumnExport `json:"workflowColumns,omitempty"`
+	PriorityTiers      []store.PriorityTierExport   `json:"priorityTiers"`
+	Sprints            []store.SprintExport         `json:"sprints,omitempty"`
+	Todos              []todoExportJSON             `json:"todos"`
+	Tags               []tagExportJSON              `json:"tags"`
+	Links              []linkExportJSON             `json:"links,omitempty"`
+	Wall               *store.WallExport            `json:"wall,omitempty"`
 }
 
 type todoExportJSON struct {
@@ -664,9 +792,12 @@ type todoExportJSON struct {
 	Rank             int64     `json:"rank"`
 	EstimationPoints *int64    `json:"estimationPoints,omitempty"`
 	AssigneeUserId   *int64    `json:"assigneeUserId,omitempty"`
+	SprintNumber     *int64    `json:"sprintNumber,omitempty"`
+	PriorityKey      *string   `json:"priorityKey"`
 	Tags             []string  `json:"tags"`
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
+	DoneAt           *int64    `json:"doneAt,omitempty"`
 }
 
 type tagExportJSON struct {
@@ -693,9 +824,12 @@ func exportDataToJSON(data *store.ExportData) exportDataJSON {
 				Rank:             t.Rank,
 				EstimationPoints: t.EstimationPoints,
 				AssigneeUserId:   t.AssigneeUserId,
+				SprintNumber:     t.SprintNumber,
+				PriorityKey:      t.PriorityKey,
 				Tags:             t.Tags,
 				CreatedAt:        t.CreatedAt,
 				UpdatedAt:        t.UpdatedAt,
+				DoneAt:           t.DoneAt,
 			})
 		}
 
@@ -717,17 +851,12 @@ func exportDataToJSON(data *store.ExportData) exportDataJSON {
 		}
 
 		projects = append(projects, projectExportJSON{
-			Slug:           p.Slug,
-			Name:           p.Name,
-			EstimationMode: p.EstimationMode,
-			Image:          p.Image,
-			DominantColor:  p.DominantColor,
-			ExpiresAt:      p.ExpiresAt,
-			CreatedAt:      p.CreatedAt,
-			UpdatedAt:      p.UpdatedAt,
-			Todos:          todos,
-			Tags:           tags,
-			Links:          links,
+			Slug: p.Slug, Name: p.Name, EstimationMode: p.EstimationMode,
+			Image: p.Image, DominantColor: p.DominantColor,
+			DefaultSprintWeeks: p.DefaultSprintWeeks, SprintsEnabled: p.SprintsEnabled,
+			ExpiresAt: p.ExpiresAt, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+			WorkflowColumns: p.WorkflowColumns, PriorityTiers: p.PriorityTiers, Sprints: p.Sprints,
+			Todos: todos, Tags: tags, Links: links, Wall: p.Wall,
 		})
 	}
 

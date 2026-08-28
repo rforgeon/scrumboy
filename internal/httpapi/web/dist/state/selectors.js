@@ -22,6 +22,21 @@ export function getSprintIdFromUrl() {
     const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("sprintId") : null;
     return v === "" ? null : (v || null);
 }
+/** Assignee filter from URL: null = "All" (omit param), "unassigned", "me", or a numeric user ID string. */
+export function getAssigneeFromUrl() {
+    const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("assignee") : null;
+    return v === "" ? null : (v || null);
+}
+/** Sort order from URL: null = default manual drag-rank order (omit param), "newest", or "oldest". */
+export function getSortFromUrl() {
+    const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("sort") : null;
+    return v === "" ? null : (v || null);
+}
+/** Priority filter from URL: null = "All priorities" (omit param), "**none**" = no priority set, or a priority tier key. */
+export function getPriorityFromUrl() {
+    const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("priority") : null;
+    return v === "" ? null : (v || null);
+}
 export function getOpenTodoSegment() {
     return current.openTodoSegment;
 }
@@ -66,6 +81,18 @@ export function getBootstrapAvailable() {
 }
 export function getPushConfigured() {
     return !!current._pushConfigured;
+}
+export function getPushStatus() {
+    return current._pushStatus ?? null;
+}
+export function getSelfServicePasswordResetEnabled() {
+    return !!current._selfServicePasswordResetEnabled;
+}
+export function getEmailNotifyAvailable() {
+    return !!current._emailNotifyAvailable;
+}
+export function getEmailNotifyPreferenceState() {
+    return current.emailNotifyPreference;
 }
 export function getOidcEnabled() {
     return !!current._oidcEnabled;

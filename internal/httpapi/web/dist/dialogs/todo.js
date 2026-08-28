@@ -1,4 +1,4 @@
-import { addTagBtn, closeTodoBtn, deleteTodoBtn, shareTodoBtn, todoBody, todoBodyPreview, todoBodyPreviewTab, todoBodyToggle, todoBodyWriteTab, todoDialog, todoDialogTitle, todoEstimationField, todoEstimationPoints, todoStatus, todoTags, todoTitle, } from '../dom/elements.js';
+import { addTagBtn, closeTodoBtn, deleteTodoBtn, shareTodoBtn, todoBody, todoBodyPreview, todoBodyPreviewTab, todoBodyToggle, todoBodyWriteTab, todoDialog, todoDialogTitle, todoEstimationField, todoEstimationPoints, todoPriority, todoStatus, todoTags, todoTitle, } from '../dom/elements.js';
 import { apiFetch } from '../api.js';
 import { DIALOG_CLOSE_REQUEST_EVENT } from '../core/modal-outside-click.js';
 import { renderMarkdownPreviewInto } from '../markdown-preview.js';
@@ -7,8 +7,8 @@ import { getBoard, getBoardMembers, getMarkdownNotesEnabled, getMermaidNotesEnab
 import { setAvailableTags, setAvailableTagsMap, setEditingTodo, setTagColors } from '../state/mutations.js';
 import { escapeHTML, isAnonymousBoard, showConfirmDialog, showToast } from '../utils.js';
 import { applyFieldTooltips, TODO_DIALOG_TOOLTIPS } from '../field-tooltips.js';
-import { apiErrorMessage, formatDate as formatLocalizedDate, hasI18nKey, t } from '../i18n/index.js';
-import { normalizeSprints } from '../sprints.js';
+import { apiErrorMessage, formatDate as formatLocalizedDate, hasI18nKey, I18N_LOCALE_CHANGED, t } from '../i18n/index.js';
+import { boardSprintsEnabled, normalizeSprints } from '../sprints.js';
 import { bindShareTodoButton, bindTodoDialogLinkLifecycle, initializeTodoDialogLinks, resetTodoDialogLinks, } from './todo-links.js';
 import { computeTodoDialogPermissions, setTodoFormPermissions, } from './todo-permissions.js';
 import { getTagsFromChips, renderTagsChips, resetTodoTagAutocompleteBindings, setupTagAutocomplete, } from './todo-tags.js';
@@ -20,6 +20,7 @@ let todoDialogCloseGuardsBound = false;
 let todoTooltipsApplied = false;
 let todoDialogBaseline = null;
 let todoDialogClosePromptOpen = false;
+let todoCreatorLocaleAbort = null;
 function sprintStateLabel(state) {
     const key = `todo.sprint.state.${state}`;
     return state && hasI18nKey(key) ? t(key) : state;
@@ -63,6 +64,21 @@ function populateTodoStatusOptions(preferredKey) {
         .join("");
     const hasPreferred = order.some((c) => c.key === preferredKey);
     const selected = hasPreferred ? preferredKey : order[0].key;
+    select.value = selected;
+    return selected;
+}
+function populateTodoPriorityOptions(preferredKey) {
+    const select = todoPriority;
+    if (!select)
+        return preferredKey ?? "";
+    const board = getBoard();
+    const tiers = board?.priorityOrder ?? [];
+    const noneOption = `<option value="" data-i18n-text="todo.priority.none">${escapeHTML(t("todo.priority.none"))}</option>`;
+    select.innerHTML =
+        noneOption +
+            tiers.map((tier) => `<option value="${escapeHTML(tier.key)}">${escapeHTML(tier.name)}</option>`).join("");
+    const hasPreferred = !!preferredKey && tiers.some((tier) => tier.key === preferredKey);
+    const selected = hasPreferred ? preferredKey : "";
     select.value = selected;
     return selected;
 }
@@ -182,6 +198,7 @@ function readTodoDialogSnapshot() {
         estimation: todoEstimationPoints?.value ?? "",
         assignee: assignee?.value ?? "",
         sprint: sprint?.value ?? "",
+        priority: todoPriority?.value ?? "",
     };
 }
 function captureTodoDialogBaseline() {
@@ -198,12 +215,15 @@ function isTodoDialogDirty() {
         current.estimation !== todoDialogBaseline.estimation ||
         current.assignee !== todoDialogBaseline.assignee ||
         current.sprint !== todoDialogBaseline.sprint ||
+        current.priority !== todoDialogBaseline.priority ||
         current.tags.length !== todoDialogBaseline.tags.length ||
         current.tags.some((tag, idx) => tag !== todoDialogBaseline?.tags[idx]));
 }
 function resetTodoDialogCloseState() {
     todoDialogBaseline = null;
     todoDialogClosePromptOpen = false;
+    todoCreatorLocaleAbort?.abort();
+    todoCreatorLocaleAbort = null;
 }
 async function closeTodoDialogInternal(options = {}) {
     const dialog = todoDialog;
@@ -334,7 +354,8 @@ export async function openTodoDialog(opts) {
         sprintSelect &&
         !isAnonymousBoard(getBoard()) &&
         !!getSlug() &&
-        opts.role === "maintainer";
+        opts.role === "maintainer" &&
+        boardSprintsEnabled(getBoard());
     if (sprintField) {
         sprintField.style.display = showSprint ? "" : "none";
     }
@@ -448,6 +469,7 @@ export async function openTodoDialog(opts) {
         }
     }
     const createdEl = document.getElementById("todoDialogCreated");
+    const createdByEl = document.getElementById("todoDialogCreatedBy");
     const updatedEl = document.getElementById("todoDialogUpdated");
     const formatDialogDate = (d) => formatLocalizedDate(d, {
         year: "2-digit",
@@ -484,6 +506,16 @@ export async function openTodoDialog(opts) {
             }
         }
     };
+    const setCreatedBy = (createdByUserId) => {
+        if (!createdByEl)
+            return;
+        const member = createdByUserId != null ? getBoardMembers().find((m) => m.userId === createdByUserId) : null;
+        const name = member?.name || member?.email || "";
+        createdByEl.textContent = name ? t("todo.dialog.openedBy", { name }) : "";
+    };
+    todoCreatorLocaleAbort?.abort();
+    todoCreatorLocaleAbort = new AbortController();
+    document.addEventListener(I18N_LOCALE_CHANGED, () => setCreatedBy(mode === "edit" ? todo?.createdByUserId : undefined), { signal: todoCreatorLocaleAbort.signal });
     if (mode === "create") {
         setTodoDialogTitleKey("todo.dialog.title.new");
         todoTitle.value = normalizeSeedTitle(opts.initialTitle);
@@ -492,10 +524,12 @@ export async function openTodoDialog(opts) {
         const initialKey = resolveColumnKey(status);
         const selected = populateTodoStatusOptions(initialKey);
         todoStatus.value = selected;
+        populateTodoPriorityOptions(null);
         deleteTodoBtn.style.display = "none";
         if (shareTodoBtn)
             shareTodoBtn.style.display = "none";
         setDates(undefined, undefined);
+        setCreatedBy(undefined);
     }
     else {
         setTodoDialogTitleKey(permissions.canSubmitTodo ? "todo.dialog.title.edit" : "todo.dialog.title.view");
@@ -505,10 +539,12 @@ export async function openTodoDialog(opts) {
         const initialKey = resolveColumnKey(todo.columnKey || todo.status);
         const selected = populateTodoStatusOptions(initialKey);
         todoStatus.value = selected;
+        populateTodoPriorityOptions(todo.priorityKey);
         deleteTodoBtn.style.display = permissions.canDeleteTodo ? "" : "none";
         if (shareTodoBtn)
             shareTodoBtn.style.display = "";
         setDates(todo.createdAt, todo.updatedAt);
+        setCreatedBy(todo.createdByUserId);
     }
     setTodoNotesMode("markdown");
     const tagInputEl = document.getElementById("todoTags");
@@ -524,6 +560,8 @@ export async function openTodoDialog(opts) {
         assigneeSelect.disabled = !permissions.canEditAssignment;
     if (estimationSelect)
         estimationSelect.disabled = !permissions.canChangeEstimation;
+    if (todoPriority)
+        todoPriority.disabled = !permissions.canChangeEstimation;
     const tagInput = document.getElementById("todoTags");
     if (tagInput)
         tagInput.disabled = !permissions.canEditTags;

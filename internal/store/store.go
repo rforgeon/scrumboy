@@ -5,24 +5,37 @@ import (
 	"database/sql"
 )
 
+// TodoAssignedMutationFacts are transaction-authoritative facts available only
+// to in-process consumers of the existing assignment publication. They are not
+// part of the public todo.assigned event payload.
+type TodoAssignedMutationFacts struct {
+	CreatedByUserID *int64 `json:"-"`
+	DurableProject  bool   `json:"-"`
+}
+
 // TodoAssignedFunc is called after a successful commit when a todo's assignee changes.
-// projectSlug comes from the project row already loaded in the same write transaction (no extra slug query).
-type TodoAssignedFunc func(ctx context.Context, projectID, todoID, localID int64, title, projectSlug string, from, to *int64, actorUserID int64)
+// projectSlug and facts come from rows already loaded in the same write transaction.
+type TodoAssignedFunc func(ctx context.Context, projectID, todoID, localID int64, title, projectSlug, activityReason string, from, to *int64, actorUserID int64, facts TodoAssignedMutationFacts)
 
 type Store struct {
 	db                    *sql.DB
 	encryptionKey         []byte // 32-byte key for TOTP secret encryption; nil if 2FA encryption disabled
+	configuredOIDCIssuer  string
 	todoAssignedPublisher TodoAssignedFunc
 }
 
 type StoreOptions struct {
-	EncryptionKey []byte // Base64-decoded 32-byte key for AES-256-GCM; nil or empty to disable 2FA encryption
+	EncryptionKey        []byte // Base64-decoded 32-byte key for AES-256-GCM; nil or empty to disable 2FA encryption
+	ConfiguredOIDCIssuer string // Canonical active issuer; empty means no currently usable SSO provider.
 }
 
 func New(db *sql.DB, opts *StoreOptions) *Store {
 	s := &Store{db: db}
 	if opts != nil && len(opts.EncryptionKey) == 32 {
 		s.encryptionKey = opts.EncryptionKey
+	}
+	if opts != nil {
+		s.configuredOIDCIssuer = opts.ConfiguredOIDCIssuer
 	}
 	return s
 }

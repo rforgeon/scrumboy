@@ -8,6 +8,7 @@ export type MessageValues = Record<string, string | number | boolean | null | un
 
 export const LOCALE_STORAGE_KEY = "scrumboy.locale";
 export const I18N_LOCALE_CHANGED = "scrumboy:i18n-locale-changed";
+const LOCALE_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 export const LOCALE_LABELS: Record<LocaleId, string> = {
   en: "English",
   de: "Deutsch",
@@ -79,7 +80,7 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "auth.2fa.submit": "Verify",
   "auth.2fa.title": "Two-factor authentication",
   "auth.actions.bootstrap": "Bootstrap",
-  "auth.actions.login": "Login",
+  "auth.actions.login": "Sign in with your Scrumboy password",
   "auth.actions.resetPassword": "Reset Password",
   "auth.bootstrap.failed": "Setup failed.",
   "auth.bootstrap.title": "First-time setup",
@@ -90,9 +91,21 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "auth.fields.newPassword.label": "New password",
   "auth.fields.newPassword.placeholder": "Min 8 characters",
   "auth.fields.password.placeholder": "Password",
+  "auth.forgot.backToSignIn": "Back to sign in",
+  "auth.forgot.failed": "Could not request a password reset.",
+  "auth.forgot.helper": "Enter your email to reset your Scrumboy password. If you sign in with SSO, reset your SSO credentials through your organization’s identity provider.",
+  "auth.forgot.link": "Forgot your Scrumboy password?",
+  "auth.forgot.submit": "Send reset link",
+  "auth.forgot.success": "If an account exists for that email address, a password reset email has been sent.",
+  "auth.forgot.title": "Reset your password",
   "auth.login.failed": "Login failed.",
   "auth.oidc.button": "Continue with SSO",
   "auth.oidc.error.email": "A verified email address is required.",
+  "auth.oidc.error.auth_time": "Your SSO provider did not supply a valid recent-authentication time. Ask the operator to verify max_age and auth_time support.",
+  "auth.oidc.error.identity_mismatch": "The SSO identity did not match the account being verified.",
+  "auth.oidc.error.link_rejected": "SSO could not be connected. Verify that the provider email matches your Scrumboy email.",
+  "auth.oidc.error.link_required": "This SSO identity cannot be signed in automatically. Sign in with your Scrumboy password and use Connect SSO.",
+  "auth.oidc.error.session_changed": "Your Scrumboy session changed during SSO verification. Start again.",
   "auth.oidc.error.generic": "Authentication failed.",
   "auth.oidc.error.provider": "The identity provider returned an error.",
   "auth.oidc.error.state_invalid": "Login session expired or invalid. Please try again.",
@@ -127,10 +140,24 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "board.bulkEdit.updatedPartial": "Updated {success} of {total} todos ({failed} failed)",
   "board.bulkEdit.updatedSingle": "Updated 1 todo",
   "board.filters.all": "All",
+  "board.filters.allAssignees": "All assignees",
+  "board.filters.allPriorities": "All priorities",
+  "board.filters.assignee": "Assignee",
+  "board.filters.assignedToMe": "Assigned to me",
+  "board.filters.defaultOrder": "Default order",
+  "board.filters.filteringOn": "Filtering: {value}",
   "board.filters.label": "Tags:",
+  "board.filters.newestFirst": "Newest first",
   "board.filters.next": "Next tags",
+  "board.filters.noPriority": "No priority",
+  "board.filters.oldestFirst": "Oldest first",
+  "board.filters.openFilters": "Filters",
   "board.filters.previous": "Previous tags",
+  "board.filters.priority": "Priority",
   "board.filters.scheduled": "Scheduled",
+  "board.filters.sort": "Sort",
+  "board.filters.sortedBy": "Sorted: {value}",
+  "board.filters.unassigned": "Unassigned",
   "board.filters.unscheduled": "Unscheduled",
   "board.loadMore": "Load more",
   "board.loadMoreFailed": "Failed to load more",
@@ -183,7 +210,7 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "board.selection.multiple": "Edit {count} selected",
   "board.selection.single": "Edit 1 selected",
   "board.status.backlog": "Backlog",
-  "board.todo.dragToReorder": "Drag to reorder",
+  "board.todo.dragCard": "Drag card",
   "board.todo.moveFailed": "Failed to move todo",
   "board.todo.movedTo": "Todo moved to {lane}",
   "board.voice.boardChanged": "The board changed before commands opened",
@@ -228,6 +255,7 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "dashboard.todo.estimationPointsAria": "Estimation points",
   "errors.BAD_REQUEST": "Bad request",
   "errors.CONFLICT": "Conflict",
+  "errors.CONFLICT.priority_tier_in_use": "This priority tier is assigned to one or more todos.",
   "errors.FORBIDDEN": "Forbidden",
   "errors.INTERNAL": "Something went wrong.",
   "errors.METHOD_NOT_ALLOWED": "Method not allowed",
@@ -258,6 +286,11 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "errors.VALIDATION_ERROR.image_too_large": "The image is too large.",
   "errors.VALIDATION_ERROR.image_wallpaper_requires_upload": "Image wallpaper must be uploaded first.",
   "errors.VALIDATION_ERROR.import_full_scope_anonymous_forbidden": "Full-scope imports are not allowed in anonymous mode.",
+  "errors.VALIDATION_ERROR.invalid_priority_key": "Please choose a valid priority tier.",
+  "errors.VALIDATION_ERROR.invalid_priority_tier_name": "Please enter a valid priority tier name.",
+  "errors.VALIDATION_ERROR.invalid_priority_tier_color": "Please choose a valid priority tier color.",
+  "errors.VALIDATION_ERROR.priority_tier_limit_reached": "A project can have at most 12 priority tiers.",
+  "errors.VALIDATION_ERROR.priority_tier_minimum_required": "A project must keep at least one priority tier.",
   "errors.VALIDATION_ERROR.invalid_color": "Please enter a valid color.",
   "errors.VALIDATION_ERROR.invalid_column_key": "Please choose a valid workflow column.",
   "errors.VALIDATION_ERROR.invalid_default_sprint_weeks": "Default sprint length must be 1 or 2 weeks.",
@@ -311,6 +344,7 @@ const BOOTSTRAP_EN_CATALOG: MessageCatalog = {
   "errors.VALIDATION_ERROR.self_edges_not_allowed": "A wall item cannot link to itself.",
   "errors.VALIDATION_ERROR.setup_token_and_code_required": "Setup token and code are required.",
   "errors.VALIDATION_ERROR.sprint_activate_requires_planned": "Only planned sprints can be activated.",
+  "errors.VALIDATION_ERROR.sprints_disabled": "Sprints are disabled for this project.",
   "errors.VALIDATION_ERROR.sprint_end_before_start": "Sprint end date must be on or after the start date.",
   "errors.VALIDATION_ERROR.sprint_end_in_past": "Sprint end date must be in the future.",
   "errors.VALIDATION_ERROR.sprint_name_exists": "A sprint with this name already exists.",
@@ -531,6 +565,14 @@ function getDefaultDocumentElement(): HTMLElement | null {
   return globalThis.document?.documentElement || null;
 }
 
+function getStoredLocale(storage: Storage | null): LocaleId | null {
+  try {
+    return normalizeLocale(storage?.getItem(LOCALE_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
 export function normalizeLocale(value: string | null | undefined): LocaleId | null {
   if (!value) return null;
   const normalized = value.trim().toLowerCase().replace("_", "-");
@@ -590,14 +632,29 @@ export function publicLocaleOptions(): PublicLocaleOption[] {
   }));
 }
 
+function normalizeBrowserLanguageTag(value: string): string {
+  return value.trim().toLowerCase().replace(/_/g, "-");
+}
+
+export function browserLanguageMatchesPublicLocale(
+  landingLocale: PublicLocaleId,
+  languages: readonly string[],
+): boolean {
+  const locale = landingLocale.toLowerCase();
+  for (const language of languages) {
+    const tag = normalizeBrowserLanguageTag(String(language));
+    if (!tag) continue;
+    if (tag === locale || tag.startsWith(`${locale}-`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function detectLocale(options: DetectLocaleOptions = {}): LocaleId {
   const storage = options.storage === undefined ? getDefaultStorage() : options.storage;
-  try {
-    const stored = normalizeLocale(storage?.getItem(LOCALE_STORAGE_KEY));
-    if (stored) return stored;
-  } catch {
-    // localStorage may be blocked; fall through to browser language.
-  }
+  const stored = getStoredLocale(storage);
+  if (stored) return stored;
 
   const languages = options.languages ?? getDefaultLanguages();
   for (const language of languages) {
@@ -668,6 +725,37 @@ function persistLocale(locale: LocaleId, storage = getDefaultStorage()): void {
   } catch {
     // Storage is best effort; the active in-memory locale still changes.
   }
+  persistLocaleCookie(locale);
+}
+
+function persistLocaleCookie(locale: LocaleId): void {
+  if (isPublicLocale(locale)) {
+    writeLocaleCookie(locale);
+    return;
+  }
+  clearLocaleCookie();
+}
+
+function writeLocaleCookie(locale: PublicLocaleId): void {
+  try {
+    const doc = globalThis.document;
+    if (!doc) return;
+    const secure = globalThis.location?.protocol === "https:" ? "; Secure" : "";
+    doc.cookie = `${LOCALE_STORAGE_KEY}=${encodeURIComponent(locale)}; Path=/; Max-Age=${LOCALE_COOKIE_MAX_AGE_SECONDS}; SameSite=Lax${secure}`;
+  } catch {
+    // Cookie persistence is best effort and only supports server-side landing negotiation.
+  }
+}
+
+function clearLocaleCookie(): void {
+  try {
+    const doc = globalThis.document;
+    if (!doc) return;
+    const secure = globalThis.location?.protocol === "https:" ? "; Secure" : "";
+    doc.cookie = `${LOCALE_STORAGE_KEY}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`;
+  } catch {
+    // Cookie persistence is best effort and only supports server-side landing negotiation.
+  }
 }
 
 function dispatchLocaleChanged(locale: LocaleId): void {
@@ -686,9 +774,11 @@ export async function initI18n(options: InitI18nOptions = {}): Promise<LocaleId>
   }
 
   const storage = options.storage === undefined ? getDefaultStorage() : options.storage;
+  const storedLocale = getStoredLocale(storage);
   const desiredLocale =
     normalizeLocale(options.locale) ||
-    detectLocale({ storage, languages: options.languages });
+    storedLocale ||
+    detectLocale({ storage: null, languages: options.languages });
 
   const en = await ensureLocaleLoaded("en");
   let nextLocale = desiredLocale;
@@ -710,6 +800,8 @@ export async function initI18n(options: InitI18nOptions = {}): Promise<LocaleId>
 
   if (options.persist === true && storage) {
     persistLocale(activeLocale, storage);
+  } else if (storedLocale && activeLocale === storedLocale) {
+    persistLocaleCookie(storedLocale);
   }
 
   return activeLocale;
@@ -969,4 +1061,5 @@ export function resetI18nForTests(): void {
   loader = defaultLoadLocale;
   catalogCache.clear();
   warnedMissingKeys.clear();
+  clearLocaleCookie();
 }

@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { EmailNotifyPreferenceState, WebPushStatus } from '../types.js';
 
 const {
   apiFetchMock,
@@ -11,6 +12,7 @@ const {
   handleThemeChangeMock,
   saveKeybindingOverrideMock,
   setKeybindingsCaptureListeningMock,
+  showToastMock,
   state,
 } = vi.hoisted(() => {
   const state = {
@@ -37,6 +39,7 @@ const {
     setKeybindingsCaptureListeningMock: vi.fn((active: boolean) => {
       state.captureListening = active;
     }),
+    showToastMock: vi.fn(),
     state,
   };
 });
@@ -57,7 +60,7 @@ vi.mock('../utils.js', () => ({
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&#039;'),
-  showToast: vi.fn(),
+  showToast: showToastMock,
   getAppVersion: () => 'test-version',
   showConfirmDialog: vi.fn(),
   confirmDelete: vi.fn(),
@@ -216,6 +219,14 @@ const enCatalog = {
   'settings.customization.wallpaper.toast.uploadFailed': 'Upload failed',
   'settings.customization.wallpaper.toast.signInRequired': 'Sign in to use a custom image',
   'settings.customization.wallpaper.toast.removed': 'Wallpaper removed',
+  'settings.customization.cardsPerLane.title': 'Cards per lane',
+  'settings.customization.cardsPerLane.description': 'Number of cards shown by default in each lane before "Load more" is needed.',
+  'settings.customization.cardsPerLane.signInHint': 'Sign in to save this preference.',
+  'settings.customization.cardsPerLane.toast.updated': 'Cards per lane updated',
+  'settings.customization.cardsPerLane.toast.updateFailed': 'Failed to update cards per lane',
+  'settings.customization.wrapLanes.title': 'Wrap lanes into rows',
+  'settings.customization.wrapLanes.description': 'On wide screens, boards with more than five lanes split into two equal rows; a leftover odd lane sits alone on the next row.',
+  'settings.customization.wrapLanes.toggleLabel': 'Wrap lanes into rows',
   'settings.customization.notifications.title': 'Desktop notifications',
   'settings.customization.notifications.description': 'OS-level alerts when someone assigns you a todo (works when this tab is in the background).',
   'settings.customization.notifications.status.unsupported': 'Not supported in this browser.',
@@ -237,8 +248,26 @@ const enCatalog = {
   'settings.customization.push.description': 'Alerts when someone assigns you a todo while this app is in the background or closed.',
   'settings.customization.push.toggleLabel': 'Web Push on this device',
   'settings.customization.push.vapidNotice': 'Web Push needs VAPID keys on the server (SCRUMBOY_VAPID_PUBLIC_KEY and SCRUMBOY_VAPID_PRIVATE_KEY; see docs).',
+  'settings.customization.push.unavailableNotice': 'Web Push is currently unavailable.',
+  'settings.customization.push.adminWarning.invalidSubscriber': 'Web Push is disabled because SCRUMBOY_VAPID_SUBSCRIBER is invalid.',
+  'settings.customization.push.adminWarning.invalidPublicKey': 'Web Push is disabled because SCRUMBOY_VAPID_PUBLIC_KEY is invalid.',
+  'settings.customization.push.adminWarning.invalidPrivateKey': 'Web Push is disabled because SCRUMBOY_VAPID_PRIVATE_KEY is invalid.',
+  'settings.customization.push.adminWarning.initializationFailed': 'Web Push is disabled because initialization failed. Check the server logs.',
+  'settings.customization.push.adminWarning.unknown': 'Web Push is disabled because of a server configuration error. Check the server logs.',
   'settings.customization.push.anonymousNotice': 'Web Push is not available in anonymous mode.',
   'settings.customization.push.unsupported': 'Web Push is not supported in this browser.',
+  'settings.customization.emailNotify.title': 'Email notifications',
+  'settings.customization.emailNotify.description': 'Get emailed about activity on your boards. Off by default.',
+  'settings.customization.emailNotify.unavailableNotice': 'Email notifications require SMTP to be configured on the server (see docs).',
+  'settings.customization.emailNotify.loadFailed': 'Could not load email notification settings. Reload the page to try again.',
+  'settings.customization.emailNotify.saveFailed': 'Could not save email notification settings. Your previous settings are still active.',
+  'settings.customization.emailNotify.toggleLabel': 'Email notifications on',
+  'settings.customization.emailNotify.category.assigned': 'When a card is assigned to me',
+  'settings.customization.emailNotify.category.createdByMe': 'When a card I opened is updated or moved',
+  'settings.customization.emailNotify.category.cardActivity': 'Card created, moved, or deleted',
+  'settings.customization.emailNotify.category.sprintActivity': 'Sprint activity',
+  'settings.customization.emailNotify.category.projectActivity': 'Project, workflow, or tag changes',
+  'settings.customization.emailNotify.category.addedToProject': "When I'm added to a project",
   'settings.backup.export.title': 'Export Data',
   'settings.backup.export.description': 'Download all your projects, todos, and tags as a JSON file.',
   'settings.backup.export.action': 'Export Backup',
@@ -316,6 +345,9 @@ async function setupSettingsView(options: {
   slug?: string | null;
   board?: Record<string, unknown> | null;
   pushConfigured?: boolean;
+  pushStatus?: WebPushStatus | null;
+  emailNotifyAvailable?: boolean;
+  emailNotifyPreference?: EmailNotifyPreferenceState;
   user?: Record<string, unknown> | null;
   open?: boolean;
 } = {}) {
@@ -323,8 +355,13 @@ async function setupSettingsView(options: {
   const settings = await loadSettingsModule();
   const mutations = await loadStateMutations();
   mutations.setAuthStatusAvailable(options.authStatusAvailable ?? true);
-  mutations.setPushConfigured(options.pushConfigured ?? false);
   mutations.setUser((options.user as any) ?? null);
+  mutations.setPushConfigured(options.pushConfigured ?? false);
+  mutations.setPushStatus(options.pushStatus ?? null);
+  mutations.setEmailNotifyAvailable(options.emailNotifyAvailable ?? false);
+  if (options.emailNotifyPreference) {
+    mutations.setEmailNotifyPreferenceState(options.emailNotifyPreference);
+  }
   mutations.setSlug(options.slug ?? null);
   mutations.setBoard((options.board as any) ?? null);
   mutations.setProjects(null);
@@ -361,6 +398,7 @@ describe('settings customization i18n', () => {
     handleThemeChangeMock.mockClear();
     saveKeybindingOverrideMock.mockClear();
     setKeybindingsCaptureListeningMock.mockClear();
+    showToastMock.mockClear();
     state.theme = 'system';
     state.wallpaperState = { v: 1, mode: 'off', hex: '#8b919a' };
     state.desktopNotificationKind = 'default';
@@ -387,7 +425,9 @@ describe('settings customization i18n', () => {
   });
 
   it('renders English shell and customization copy by default', async () => {
-    await setupSettingsView();
+    await setupSettingsView({
+      user: { id: 1, name: 'Alex' },
+    });
 
     expect(document.getElementById('settingsDialogTitleLabel')?.textContent).toBe('Settings');
     expect(document.getElementById('settingsDialogVersion')?.textContent).toBe(' vtest-version');
@@ -396,6 +436,43 @@ describe('settings customization i18n', () => {
     expect(document.querySelector('.settings-section__title')?.textContent).toBe('Language');
     expect(document.getElementById('desktopNotifyStatus')?.textContent).toBe(enCatalog['settings.customization.notifications.status.default']);
     expect(document.querySelector('.settings-section--keybindings .settings-section__title')?.textContent).toBe('Keybindings');
+  });
+
+  it('omits user-only Customization controls when no signed-in user (Anonymous Mode)', async () => {
+    await setupSettingsView({
+      authStatusAvailable: false,
+      user: null,
+    });
+
+    const html = document.getElementById('settingsCustomizationContent')?.innerHTML ?? '';
+    expect(document.querySelector('label[for="settingsLocaleSelect"]')?.textContent).toBe('Language');
+    expect(document.querySelector('[data-i18n-text="settings.customization.theme.title"]')?.textContent).toBe('Theme');
+    expect(document.querySelector('[data-i18n-text="settings.customization.wrapLanes.title"]')?.textContent).toBe('Wrap lanes into rows');
+    expect(document.querySelector('.settings-section--keybindings .settings-section__title')?.textContent).toBe('Keybindings');
+    expect(document.getElementById('cardsPerLaneSelect')).toBeNull();
+    expect(html).not.toContain('Cards per lane');
+    expect(html).not.toContain('Sign in to save this preference');
+    expect(document.querySelector('[data-i18n-text="settings.customization.cardsPerLane.signInHint"]')).toBeNull();
+    expect(document.getElementById('desktopNotifyEnableBtn')).toBeNull();
+    expect(document.querySelector('[data-i18n-text="settings.customization.notifications.title"]')).toBeNull();
+    expect(document.querySelector('.settings-section--push-pwa')).toBeNull();
+    expect(document.querySelector('[data-i18n-text="settings.customization.push.title"]')).toBeNull();
+    expect(html).not.toContain('Web Push is not available in anonymous mode');
+    expect(document.querySelector('[data-i18n-text="settings.customization.voiceFlow.title"]')).toBeNull();
+  });
+
+  it('keeps user-only Customization controls when a signed-in user is present', async () => {
+    await setupSettingsView({
+      user: { id: 1, name: 'Alex' },
+    });
+
+    expect(document.getElementById('cardsPerLaneSelect')).toBeInstanceOf(HTMLSelectElement);
+    expect(document.querySelector('[data-i18n-text="settings.customization.cardsPerLane.title"]')?.textContent).toBe('Cards per lane');
+    expect(document.querySelector('[data-i18n-text="settings.customization.notifications.title"]')?.textContent).toBe('Desktop notifications');
+    expect(document.getElementById('desktopNotifyEnableBtn')).toBeInstanceOf(HTMLButtonElement);
+    expect(document.querySelector('.settings-section--push-pwa')).toBeTruthy();
+    expect(document.querySelector('[data-i18n-text="settings.customization.push.title"]')?.textContent).toBe('Background notifications (PWA)');
+    expect(document.querySelector('[data-i18n-text="settings.customization.voiceFlow.title"]')?.textContent).toBe('VoiceFlow');
   });
 
   it('renders catalog-backed pseudo strings on first render', async () => {
@@ -528,7 +605,9 @@ describe('settings customization i18n', () => {
 
   it('updates desktop notification labels on locale change without requesting permission', async () => {
     state.desktopNotificationKind = 'granted';
-    const { i18n } = await setupSettingsView();
+    const { i18n } = await setupSettingsView({
+      user: { id: 1, name: 'Alex' },
+    });
 
     const status = document.getElementById('desktopNotifyStatus');
     const button = document.getElementById('desktopNotifyEnableBtn') as HTMLButtonElement | null;
@@ -547,6 +626,77 @@ describe('settings customization i18n', () => {
     expect(button.textContent).toBe(`DE ${enCatalog['settings.customization.notifications.actions.enabled']}`);
     expect(button.disabled).toBe(true);
     expect(requestDesktopNotificationPermissionMock).not.toHaveBeenCalled();
+  });
+
+  it('relocalizes an open administrator Web Push warning', async () => {
+    const { i18n } = await setupSettingsView({
+      user: { id: 1, name: 'Admin', systemRole: 'owner' },
+      pushStatus: { state: 'invalid', reason: 'invalid_subscriber' },
+    });
+
+    const warning = document.querySelector<HTMLElement>('.settings-push-vapid-notice');
+    expect(warning?.textContent).toBe(enCatalog['settings.customization.push.adminWarning.invalidSubscriber']);
+
+    await i18n.setLocale('de');
+    await flushPromises();
+
+    expect(document.querySelector('.settings-push-vapid-notice')?.textContent).toBe(
+      `DE ${enCatalog['settings.customization.push.adminWarning.invalidSubscriber']}`,
+    );
+  });
+
+  it('renders a localized load failure with disabled email controls', async () => {
+    await setupSettingsView({
+      locale: 'pseudo',
+      user: { id: 1, name: 'Alex' },
+      emailNotifyAvailable: true,
+      emailNotifyPreference: { userId: 1, status: 'error', value: null },
+    });
+
+    expect(document.querySelector('.settings-section--email-notify p')?.textContent).toBe(
+      '[!! Could not load email notification settings. Reload the page to try again. !!]',
+    );
+    expect((document.getElementById('emailNotifyEnabledToggle') as HTMLInputElement).disabled).toBe(true);
+    expect(Array.from(document.querySelectorAll<HTMLInputElement>('.email-notify-category-toggle')).every((input) => input.disabled)).toBe(true);
+  });
+
+  it('restores the previous email preference and shows localized generic copy after a rejected save', async () => {
+    await setupSettingsView({
+      locale: 'pseudo',
+      user: { id: 1, name: 'Alex' },
+      emailNotifyAvailable: true,
+      emailNotifyPreference: {
+        userId: 1,
+        status: 'ready',
+        value: {
+          v: 2,
+          enabled: false,
+          assigned: true,
+          createdByMe: false,
+          cardActivity: false,
+          sprintActivity: false,
+          projectActivity: false,
+          addedToProject: true,
+        },
+      },
+    });
+    apiFetchMock.mockRejectedValueOnce(new Error('sensitive backend detail'));
+
+    const toggle = document.getElementById('emailNotifyEnabledToggle') as HTMLInputElement;
+    const creatorToggle = document.querySelector<HTMLInputElement>('.email-notify-category-toggle[data-category="createdByMe"]');
+    expect(creatorToggle).not.toBeNull();
+    expect(creatorToggle?.checked).toBe(false);
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    await flushPromises(16);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flushPromises(8);
+
+    expect((document.getElementById('emailNotifyEnabledToggle') as HTMLInputElement).checked).toBe(false);
+    expect(showToastMock).toHaveBeenCalledWith(
+      '[!! Could not save email notification settings. Your previous settings are still active. !!]',
+    );
+    expect(showToastMock).not.toHaveBeenCalledWith('sensitive backend detail');
   });
 
   it('relocalizes backup tab static chrome in place on locale change without API calls', async () => {
@@ -579,7 +729,10 @@ describe('settings customization i18n', () => {
   });
 
   it('does not mutate hidden settings content on locale change while the dialog is closed', async () => {
-    const { i18n } = await setupSettingsView({ open: false });
+    const { i18n } = await setupSettingsView({
+      open: false,
+      user: { id: 1, name: 'Alex' },
+    });
 
     const titleBefore = document.getElementById('settingsDialogTitleLabel')?.textContent;
     const tabBefore = document.querySelector('.settings-tab[data-tab="customization"]')?.textContent;

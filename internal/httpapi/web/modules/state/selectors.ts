@@ -1,5 +1,5 @@
 import { current } from './state.js';
-import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus } from '../types.js';
+import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus, WebPushStatus, EmailNotifyPreferenceState } from '../types.js';
 import type { BoardMember } from './state.js';
 
 export function getRoute(): RouteName | null {
@@ -29,6 +29,24 @@ export function getSearch(): string {
 /** Sprint filter from URL: null = "All" (omit param), "scheduled" = in-sprint, "unscheduled" = backlog, or numeric string = specific sprint. */
 export function getSprintIdFromUrl(): string | null {
   const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("sprintId") : null;
+  return v === "" ? null : (v || null);
+}
+
+/** Assignee filter from URL: null = "All" (omit param), "unassigned", "me", or a numeric user ID string. */
+export function getAssigneeFromUrl(): string | null {
+  const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("assignee") : null;
+  return v === "" ? null : (v || null);
+}
+
+/** Sort order from URL: null = default manual drag-rank order (omit param), "newest", or "oldest". */
+export function getSortFromUrl(): string | null {
+  const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("sort") : null;
+  return v === "" ? null : (v || null);
+}
+
+/** Priority filter from URL: null = "All priorities" (omit param), "**none**" = no priority set, or a priority tier key. */
+export function getPriorityFromUrl(): string | null {
+  const v = typeof window !== "undefined" ? new URL(window.location.href).searchParams.get("priority") : null;
   return v === "" ? null : (v || null);
 }
 
@@ -90,6 +108,22 @@ export function getBootstrapAvailable(): boolean | undefined {
 
 export function getPushConfigured(): boolean {
   return !!current._pushConfigured;
+}
+
+export function getPushStatus(): WebPushStatus | null {
+  return current._pushStatus ?? null;
+}
+
+export function getSelfServicePasswordResetEnabled(): boolean {
+  return !!current._selfServicePasswordResetEnabled;
+}
+
+export function getEmailNotifyAvailable(): boolean {
+  return !!current._emailNotifyAvailable;
+}
+
+export function getEmailNotifyPreferenceState(): EmailNotifyPreferenceState {
+  return current.emailNotifyPreference;
 }
 
 export function getOidcEnabled(): boolean {

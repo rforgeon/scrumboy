@@ -11,9 +11,11 @@ import (
 // resolveAndValidateAuth runs MCP auth resolution and writes JSON errors when auth cannot proceed.
 // On success, ok is true and ctx is ready for tool handlers. On failure, ok is false (response already sent).
 func (a *Adapter) resolveAndValidateAuth(w http.ResponseWriter, r *http.Request) (ctx context.Context, ok bool) {
-	authRes := a.resolveRequestAuth(r)
+	authRes := a.resolveRequestAuth(r, false)
 	if authRes.Err != nil {
-		writeError(w, newAdapterError(http.StatusInternalServerError, CodeInternal, "internal error", map[string]any{"detail": authRes.Err.Error()}))
+		err := newAdapterError(http.StatusInternalServerError, CodeInternal, "internal error", map[string]any{"detail": authRes.Err.Error()})
+		a.logAdapterError("legacy", "authentication", err)
+		writeError(w, err)
 		return nil, false
 	}
 	if authRes.BearerAuthFailed {
@@ -26,7 +28,11 @@ func (a *Adapter) resolveAndValidateAuth(w http.ResponseWriter, r *http.Request)
 func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
-	if r.URL.Path == "/mcp/rpc" || r.URL.Path == "/mcp/rpc/" {
+	if r.URL.Path == "/mcp/rpc/" {
+		http.Redirect(w, r, "/mcp/rpc", http.StatusPermanentRedirect)
+		return
+	}
+	if r.URL.Path == "/mcp/rpc" {
 		a.serveJSONRPC(w, r)
 		return
 	}
@@ -43,6 +49,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		data, meta, err := a.handleSystemGetCapabilities(ctx, nil)
 		if err != nil {
+			a.logAdapterError("legacy", "system_getCapabilities", err)
 			writeError(w, err)
 			return
 		}
@@ -77,6 +84,7 @@ func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	data, meta, toolErr := handler(ctx, req.Input)
 	if toolErr != nil {
+		a.logAdapterError("legacy", req.Tool, toolErr)
 		writeError(w, toolErr)
 		return
 	}
@@ -115,12 +123,8 @@ func writeError(w http.ResponseWriter, err *adapterError) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(err.Status)
 	_ = json.NewEncoder(w).Encode(errorResponse{
-		OK: false,
-		Error: errorResponseBody{
-			Code:    err.Code,
-			Message: err.Message,
-			Details: normalizeDetails(err.Details),
-		},
+		OK:    false,
+		Error: clientErrorResponseBody(err),
 	})
 }
 

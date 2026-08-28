@@ -15,15 +15,22 @@ import (
 	"scrumboy/internal/store"
 )
 
-func clientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if i := strings.Index(xff, ","); i >= 0 {
-			xff = strings.TrimSpace(xff[:i])
+// clientIP returns the key used for per-IP rate limiting. X-Forwarded-For is only honored when
+// s.trustProxy is set (SCRUMBOY_TRUST_PROXY) — otherwise any client could spoof it to get a fresh
+// rate-limit bucket on every request, defeating IP-based limits for login, 2FA, OAuth DCR/token,
+// and other authentication rate limits. OAuth endpoints have dedicated limiter instances but use
+// this same trusted client-IP boundary. Default to RemoteAddr, which a client cannot forge.
+func (s *Server) clientIP(r *http.Request) string {
+	if s != nil && s.trustProxy {
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			if i := strings.Index(xff, ","); i >= 0 {
+				xff = strings.TrimSpace(xff[:i])
+			}
+			if host, _, err := net.SplitHostPort(xff); err == nil {
+				return host
+			}
+			return xff
 		}
-		if host, _, err := net.SplitHostPort(xff); err == nil {
-			return host
-		}
-		return xff
 	}
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if host != "" {
@@ -65,7 +72,7 @@ func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ipKey := "ip:" + clientIP(r)
+	ipKey := "ip:" + s.clientIP(r)
 	emailKey := "email:" + ratelimit.NormalizeEmail(u.Email)
 	if s.authRateLimit != nil && !s.authRateLimit.Allow(ipKey, emailKey) {
 		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
@@ -85,27 +92,29 @@ func (s *Server) handleLogin2FA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := strings.TrimSpace(in.Code)
-
-	// Verification order: recovery code first, then TOTP
-	consumed, err := s.store.ConsumeRecoveryCode(ctx, u.ID, code)
+	verified, recoveryCodeID, err := s.verifySensitiveSecondFactor(r, u, in.Code)
+	if errors.Is(err, errSensitiveRateLimited) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
+		return
+	}
 	if err != nil {
 		writeStoreErr(w, err, true)
 		return
 	}
-	if consumed {
-		s.finishLogin2FA(w, r, ctx, in.TempToken, u)
-		return
-	}
-
-	secret, err := s.store.GetUserTwoFactorSecret(ctx, u.ID)
-	if err != nil {
-		writeStoreErr(w, err, true)
-		return
-	}
-	if !crypto.ValidateTOTPCode(secret, code) {
+	if !verified {
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid code", nil)
 		return
+	}
+	if recoveryCodeID > 0 {
+		consumed, err := s.store.ConsumeRecoveryCodeID(ctx, u.ID, recoveryCodeID)
+		if err != nil {
+			writeStoreErr(w, err, true)
+			return
+		}
+		if !consumed {
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid code", nil)
+			return
+		}
 	}
 
 	s.finishLogin2FA(w, r, ctx, in.TempToken, u)
@@ -143,7 +152,7 @@ func (s *Server) handle2FASetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ipKey := "ip:" + clientIP(r)
+	ipKey := "ip:" + s.clientIP(r)
 	u, _ := s.store.GetUser(ctx, userID)
 	emailKey := "email:" + ratelimit.NormalizeEmail(u.Email)
 	if s.authRateLimit != nil && !s.authRateLimit.Allow(ipKey, emailKey) {
@@ -223,6 +232,23 @@ func (s *Server) handle2FAEnable(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
 		return
 	}
+	u, err := s.store.GetUser(ctx, userID)
+	if err != nil {
+		writeStoreErr(w, err, false)
+		return
+	}
+	if !s.allowSensitive(s.secondFactorLimiter, r, u.ID) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
+		return
+	}
+	if classifySecondFactor(in.Code) != "totp" {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid code", nil)
+		return
+	}
+	if !s.allowSensitive(s.totpLimiter, r, u.ID) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
+		return
+	}
 
 	if err := s.store.IncrementEnrollmentAttempt(ctx, in.SetupToken); err != nil {
 		if errors.Is(err, store.ErrTooManyAttempts) {
@@ -291,6 +317,10 @@ func (s *Server) handle2FADisable(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err, false)
 		return
 	}
+	if !s.allowSensitive(s.currentPasswordLimiter, r, u.ID) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
+		return
+	}
 	if _, err := s.store.AuthenticateUser(ctx, u.Email, in.Password); err != nil {
 		if errors.Is(err, store.ErrUnauthorized) {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid password", nil)
@@ -325,7 +355,7 @@ func (s *Server) handle2FARecoveryRegenerate(w http.ResponseWriter, r *http.Requ
 	}
 
 	u, _ := s.store.GetUser(ctx, userID)
-	ipKey := "ip:" + clientIP(r)
+	ipKey := "ip:" + s.clientIP(r)
 	emailKey := "email:" + ratelimit.NormalizeEmail(u.Email)
 	if s.authRateLimit != nil && !s.authRateLimit.Allow(ipKey, emailKey) {
 		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)

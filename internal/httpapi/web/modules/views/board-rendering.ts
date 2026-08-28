@@ -1,6 +1,6 @@
 import { columnsSpec } from '../features/drag-drop.js';
 import type { BoardMember } from '../state/state.js';
-import { Board, Todo } from '../types.js';
+import { Board, NO_PRIORITY_FILTER_VALUE, PriorityTier, Todo } from '../types.js';
 import {
   escapeHTML,
   isTemporaryBoard,
@@ -34,7 +34,17 @@ export type RenderTodoCardOpts = {
   tagColors?: Record<string, string>;
   showPointsMode?: boolean;
   selectedIds?: Set<number>;
+  priorityTiers?: Record<string, { name: string; color: string }>;
 };
+
+export function buildPriorityTierMap(board: Board): Record<string, { name: string; color: string }> {
+  const tiers = board.priorityOrder ?? [];
+  const out: Record<string, { name: string; color: string }> = {};
+  for (const tier of tiers) {
+    out[tier.key] = { name: tier.name, color: tier.color };
+  }
+  return out;
+}
 
 type BuildTopbarHtmlArgs = {
   board: Board;
@@ -50,6 +60,10 @@ type BuildTopbarHtmlArgs = {
   backLabel: string;
   backLabelKey?: string | null;
   wallEnabled?: boolean;
+  assignee?: string | null;
+  sort?: string | null;
+  priority?: string | null;
+  boardMembers?: BoardMember[];
 };
 
 type BuildBoardColumnsHtmlArgs = {
@@ -73,6 +87,10 @@ export function getBoardColumns(board: Board): BoardColumn[] {
     return order.map((c) => ({ key: c.key, title: c.name, color: c.color, isDone: !!c.isDone }));
   }
   return columnsSpec().map((c) => ({ key: c.key, title: c.title, isDone: c.key === "done", color: undefined }));
+}
+
+export function visibleBoardLaneCount(board: Board): number {
+  return getBoardColumns(board).length + (board.agenda?.enabled ? 1 : 0);
 }
 
 export function laneColumnTintClassAndStyle(c: { color?: string }): { extraClass: string; styleAttr: string } {
@@ -191,8 +209,28 @@ export function renderTodoCard(
   const pointsHTML = showPoints
     ? `<span class="card__points"${titleAttr(FIELD_TOOLTIPS.estimationPoints)} aria-label="${escapeHTML(t("todo.fields.estimationPoints"))}" data-i18n-aria-label="todo.fields.estimationPoints">${todo.estimationPoints}</span>`
     : "";
-  const footerContent = pointsHTML + avatarHTML;
+  const priorityTier = todo.priorityKey ? opts?.priorityTiers?.[todo.priorityKey] : null;
+  const priorityColor = sanitizeHexColor(priorityTier?.color ?? null);
+  const priorityStyle = priorityColor
+    ? ` style="border-color:${priorityColor}; background:${priorityColor}20; color:${priorityColor};"`
+    : "";
+  const priorityHTML = priorityTier
+    ? `<span class="card__priority"${priorityStyle}${titleAttr(FIELD_TOOLTIPS.priority)} aria-label="${escapeHTML(t("todo.fields.priority"))}: ${escapeHTML(priorityTier.name)}">${escapeHTML(priorityTier.name)}</span>`
+    : "";
+  const footerContent = priorityHTML + pointsHTML + avatarHTML;
   const selectedClass = opts?.selectedIds?.has(todo.id) ? " card--selected" : "";
+  const dragHandleHTML = `
+      <div class="card__drag-handle" aria-label="${escapeHTML(t("board.todo.dragCard"))}" data-i18n-aria-label="board.todo.dragCard">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <circle cx="4" cy="3" r="1.5"/>
+          <circle cx="4" cy="8" r="1.5"/>
+          <circle cx="4" cy="13" r="1.5"/>
+          <circle cx="12" cy="3" r="1.5"/>
+          <circle cx="12" cy="8" r="1.5"/>
+          <circle cx="12" cy="13" r="1.5"/>
+        </svg>
+      </div>
+    `;
   return `
     <button class="card card--${todo.status.toLowerCase()}${selectedClass}"${borderStyle} data-todo-id="${todo.id}" data-todo-local-id="${todo.localId}"${todo.assigneeUserId != null ? ` data-assignee-user-id="${todo.assigneeUserId}"` : ""} id="todo_${todo.id}" type="button">
       <div class="card__content">
@@ -211,16 +249,7 @@ export function renderTodoCard(
   </div>
 ` : ""}
       </div>
-      <div class="card__drag-handle" aria-label="${escapeHTML(t("board.todo.dragToReorder"))}" data-i18n-aria-label="board.todo.dragToReorder">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <circle cx="4" cy="3" r="1.5"/>
-          <circle cx="4" cy="8" r="1.5"/>
-          <circle cx="4" cy="13" r="1.5"/>
-          <circle cx="12" cy="3" r="1.5"/>
-          <circle cx="12" cy="8" r="1.5"/>
-          <circle cx="12" cy="13" r="1.5"/>
-        </svg>
-      </div>
+      ${dragHandleHTML}
     </button>
   `;
 }
@@ -283,7 +312,12 @@ export function buildTopbarHtml(args: BuildTopbarHtmlArgs): string {
     backLabel,
     backLabelKey,
     wallEnabled,
+    assignee,
+    sort,
+    priority,
+    boardMembers,
   } = args;
+  const filterPanelHTML = buildFilterPanelHtml(assignee ?? null, sort ?? null, boardMembers ?? [], user, priority ?? null, board.priorityOrder ?? []);
   const voiceCommandClass = showVoiceCommands ? "topbar--voice-commands-on" : "topbar--voice-commands-off";
   const voiceCommandTriggerHTML = showVoiceCommands ? renderVoiceCommandTriggerHtml() : "";
   // Scrumbaby is durable-projects-only; temp/anonymous boards never see the entry point.
@@ -331,6 +365,7 @@ export function buildTopbarHtml(args: BuildTopbarHtmlArgs): string {
             ${titleAttr(FIELD_TOOLTIPS.boardSearch)}
           />
           ${search && search.trim() !== "" ? `<button class="search-clear" id="searchClear" aria-label="${clearSearchLabel}" title="${clearSearchLabel}" data-i18n-aria-label="board.actions.clearSearch" data-i18n-title="board.actions.clearSearch">✕</button>` : ''}
+          ${filterPanelHTML}
         </div>
         ${isAnonymousTempBoard ? `<button class="btn btn--ghost" id="renameProjectBtn" title="${renameProjectLabel}" data-i18n-title="board.actions.renameProject" data-i18n-text="board.actions.renameProject">${renameProjectLabel}</button>` : ''}
         ${(isTemporaryBoard(board) || currentUserProjectRole === 'maintainer') ? `<button class="btn" id="newTodoBtn" title="${newTodoLabel}" aria-label="${newTodoLabel}" data-i18n-title="board.actions.newTodo" data-i18n-aria-label="board.actions.newTodo"><img src="/new.svg" alt="" width="20" height="20" /></button>` : ''}
@@ -367,6 +402,7 @@ export function buildTopbarHtml(args: BuildTopbarHtmlArgs): string {
             ${titleAttr(FIELD_TOOLTIPS.boardSearch)}
           />
           ${search && search.trim() !== "" ? `<button class="search-clear" id="searchClear" aria-label="${clearSearchLabel}" title="${clearSearchLabel}" data-i18n-aria-label="board.actions.clearSearch" data-i18n-title="board.actions.clearSearch">✕</button>` : ''}
+          ${filterPanelHTML}
         </div>
         ${isAnonymousTempBoard ? `<button class="btn btn--ghost" id="renameProjectBtn" title="${renameProjectLabel}" data-i18n-title="board.actions.renameProject" data-i18n-text="board.actions.renameProject">${renameProjectLabel}</button>` : ''}
         ${(isTemporaryBoard(board) || currentUserProjectRole === 'maintainer') ? `<button class="btn" id="newTodoBtn" title="${newTodoLabel}" aria-label="${newTodoLabel}" data-i18n-title="board.actions.newTodo" data-i18n-aria-label="board.actions.newTodo"><img src="/new.svg" alt="" width="20" height="20" /></button>` : ''}
@@ -379,6 +415,124 @@ export function buildTopbarHtml(args: BuildTopbarHtmlArgs): string {
         ${renderUserAvatar(user)}
       </div>
     `;
+}
+
+function memberDisplayName(member: BoardMember): string {
+  return member.name || member.email || '';
+}
+
+function assigneeFilterOptionsHtml(assignee: string | null, boardMembers: BoardMember[], user: any): string {
+  const current = assignee || "";
+  const allAssigneesLabel = escapeHTML(t("board.filters.allAssignees"));
+  const unassignedLabel = escapeHTML(t("board.filters.unassigned"));
+  const assignedToMeLabel = escapeHTML(t("board.filters.assignedToMe"));
+  const currentUserId = user && typeof user.id === "number" ? user.id : null;
+  const meIsActive = current === "me" || (currentUserId != null && current === String(currentUserId));
+  const optionClass = (value: string, active = current === value) => `search-filter-option${active ? " is-active" : ""}`;
+  const meOption = user
+    ? `<button type="button" class="${optionClass("me", meIsActive)}" data-assignee-option="me" data-i18n-text="board.filters.assignedToMe">${assignedToMeLabel}</button>`
+    : "";
+  const memberOptions = boardMembers
+    .filter((m) => currentUserId == null || m.userId !== currentUserId)
+    .map((m) => {
+      const value = String(m.userId);
+      return `<button type="button" class="${optionClass(value)}" data-assignee-option="${escapeHTML(value)}">${escapeHTML(memberDisplayName(m))}</button>`;
+    })
+    .join("");
+  return `
+      <button type="button" class="${optionClass("")}" data-assignee-option="" data-i18n-text="board.filters.allAssignees">${allAssigneesLabel}</button>
+      <button type="button" class="${optionClass("unassigned")}" data-assignee-option="unassigned" data-i18n-text="board.filters.unassigned">${unassignedLabel}</button>
+      ${meOption}
+      ${memberOptions}
+  `;
+}
+
+function sortFilterOptionsHtml(sort: string | null): string {
+  const current = sort || "";
+  const optionClass = (value: string) => `search-filter-option${current === value ? " is-active" : ""}`;
+  const defaultLabel = escapeHTML(t("board.filters.defaultOrder"));
+  const newestLabel = escapeHTML(t("board.filters.newestFirst"));
+  const oldestLabel = escapeHTML(t("board.filters.oldestFirst"));
+  return `
+      <button type="button" class="${optionClass("")}" data-sort-option="" data-i18n-text="board.filters.defaultOrder">${defaultLabel}</button>
+      <button type="button" class="${optionClass("newest")}" data-sort-option="newest" data-i18n-text="board.filters.newestFirst">${newestLabel}</button>
+      <button type="button" class="${optionClass("oldest")}" data-sort-option="oldest" data-i18n-text="board.filters.oldestFirst">${oldestLabel}</button>
+  `;
+}
+
+function priorityFilterOptionsHtml(priority: string | null, tiers: PriorityTier[]): string {
+  const current = priority || "";
+  const optionClass = (value: string) => `search-filter-option${current === value ? " is-active" : ""}`;
+  const allPrioritiesLabel = escapeHTML(t("board.filters.allPriorities"));
+  const noPriorityLabel = escapeHTML(t("board.filters.noPriority"));
+  const tierOptions = tiers
+    .map((tier) => {
+      const safe = sanitizeHexColor(tier.color);
+      const colorStyle = safe ? `style="border-color: ${safe}; background: ${safe}20;"` : "";
+      return `<button type="button" class="${optionClass(tier.key)}" data-priority-option="${escapeHTML(tier.key)}" ${colorStyle}>${escapeHTML(tier.name)}</button>`;
+    })
+    .join("");
+  return `
+      <button type="button" class="${optionClass("")}" data-priority-option="" data-i18n-text="board.filters.allPriorities">${allPrioritiesLabel}</button>
+      <button type="button" class="${optionClass(NO_PRIORITY_FILTER_VALUE)}" data-priority-option="${NO_PRIORITY_FILTER_VALUE}" data-i18n-text="board.filters.noPriority">${noPriorityLabel}</button>
+      ${tierOptions}
+  `;
+}
+
+// isBoardFilterActive is true whenever a non-default assignee filter, a
+// non-default (manual) sort order, or a priority filter is applied. Used to
+// drive the toggle's pulse animation, both on initial render and after the
+// user picks an option.
+export function isBoardFilterActive(assignee: string | null, sort: string | null, priority: string | null): boolean {
+  return !!assignee || !!sort || !!priority;
+}
+
+// buildFilterPanelHtml is the single source of truth for the assignee/sort/priority
+// option lists (labels + i18n + active-state) rendered inside the expandable
+// search-filter popover. It replaces the old standalone <select> (assignee
+// only) with a button-list panel that also carries the sort and priority
+// options, dual-purposing the search input instead of adding another topbar control.
+export function buildFilterPanelHtml(
+  assignee: string | null,
+  sort: string | null,
+  boardMembers: BoardMember[],
+  user: any,
+  priority: string | null = null,
+  priorityTiers: PriorityTier[] = [],
+): string {
+  const filtersLabel = escapeHTML(t("board.filters.openFilters"));
+  const toggleActiveClass = isBoardFilterActive(assignee, sort, priority) ? " search-filter-toggle--active" : "";
+  return `
+    <button
+      type="button"
+      class="search-filter-toggle${toggleActiveClass}"
+      id="searchFilterToggle"
+      aria-expanded="false"
+      aria-haspopup="true"
+      aria-label="${filtersLabel}"
+      title="${filtersLabel}"
+      data-i18n-aria-label="board.filters.openFilters"
+      data-i18n-title="board.filters.openFilters"
+    >
+      <svg width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true" focusable="false">
+        <path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+    <div class="search-filter-panel" id="searchFilterPanel" hidden>
+      <div class="search-filter-panel__section">
+        <div class="search-filter-panel__label" data-i18n-text="board.filters.assignee">${escapeHTML(t("board.filters.assignee"))}</div>
+        ${assigneeFilterOptionsHtml(assignee, boardMembers, user)}
+      </div>
+      <div class="search-filter-panel__section">
+        <div class="search-filter-panel__label" data-i18n-text="board.filters.sort">${escapeHTML(t("board.filters.sort"))}</div>
+        ${sortFilterOptionsHtml(sort)}
+      </div>
+      <div class="search-filter-panel__section">
+        <div class="search-filter-panel__label" data-i18n-text="board.filters.priority">${escapeHTML(t("board.filters.priority"))}</div>
+        ${priorityFilterOptionsHtml(priority, priorityTiers)}
+      </div>
+    </div>
+  `;
 }
 
 export function buildNoResultsHtml(search: string): string {

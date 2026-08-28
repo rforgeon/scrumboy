@@ -4,6 +4,9 @@
 
 import { invalidateBoard } from "../orchestration/board-refresh.js";
 import {
+  getAssigneeFromUrl,
+  getPriorityFromUrl,
+  getSortFromUrl,
   getAuthStatusAvailable,
   getSlug,
   getTag,
@@ -46,7 +49,7 @@ async function runResumeResync(reason: string): Promise<void> {
   const slug = getSlug();
   if (slug) {
     try {
-      await invalidateBoard(slug, getTag(), getSearch(), getSprintIdFromUrl());
+      await invalidateBoard(slug, getTag(), getSearch(), getSprintIdFromUrl(), getAssigneeFromUrl(), getSortFromUrl(), getPriorityFromUrl());
     } catch (err) {
       console.warn("Resume board resync failed:", err);
     }

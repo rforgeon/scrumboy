@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { WebPushStatus } from './types.js';
 
 const {
   apiFetchMock,
@@ -128,7 +129,8 @@ describe('router push autosubscribe gate', () => {
     initForegroundLifecycleMock.mockReset();
     hydrateNotificationsForUserMock.mockReset();
     initNotificationBadgeMock.mockReset();
-    unsubscribeFromPushMock.mockClear();
+    unsubscribeFromPushMock.mockReset();
+    unsubscribeFromPushMock.mockResolvedValue(undefined);
     maybeAutoSubscribePushAfterLoginMock.mockClear();
     loadUserThemeMock.mockClear();
     applyWallpaperForAuthContextMock.mockClear();
@@ -144,7 +146,7 @@ describe('router push autosubscribe gate', () => {
     vi.restoreAllMocks();
   });
 
-  function installAuthStatus(pushConfigured: boolean): void {
+  function installAuthStatus(pushConfigured: boolean, push?: WebPushStatus): void {
     apiFetchMock.mockImplementation(async (url: string) => {
       if (url === '/api/auth/status') {
         return {
@@ -152,6 +154,8 @@ describe('router push autosubscribe gate', () => {
           bootstrapAvailable: false,
           mode: 'full',
           pushConfigured,
+          push,
+          selfServicePasswordResetEnabled: false,
           oidcEnabled: false,
           localAuthEnabled: true,
           wallEnabled: false,
@@ -164,6 +168,29 @@ describe('router push autosubscribe gate', () => {
       }
       if (url.startsWith('/api/user/preferences?key=')) {
         return {};
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  function installSignedOutAuthStatus(selfServicePasswordResetEnabled?: boolean): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        const status: Record<string, unknown> = {
+          user: null,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+        if (selfServicePasswordResetEnabled !== undefined) {
+          status.selfServicePasswordResetEnabled = selfServicePasswordResetEnabled;
+        }
+        return status;
       }
       throw new Error(`unexpected apiFetch url: ${url}`);
     });
@@ -188,5 +215,743 @@ describe('router push autosubscribe gate', () => {
     expect(maybeAutoSubscribePushAfterLoginMock).toHaveBeenCalledTimes(1);
     expect(maybeAutoSubscribePushAfterLoginMock).toHaveBeenCalledWith(7);
     expect(renderProjectsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('hydrates structured Web Push status and clears it on logout', async () => {
+    installAuthStatus(false, { state: 'invalid', reason: 'invalid_subscriber' });
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    const selectors = await import('./state/selectors.js');
+    const mutations = await import('./state/mutations.js');
+    expect(selectors.getPushStatus()).toEqual({ state: 'invalid', reason: 'invalid_subscriber' });
+
+    mutations.setAuthStatusChecked(false);
+    installSignedOutAuthStatus();
+    await mod.router();
+
+    expect(selectors.getPushStatus()).toBeNull();
+  });
+
+  it('passes the self-service password-reset capability to the signed-out auth view', async () => {
+    installSignedOutAuthStatus(true);
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(renderAuthMock).toHaveBeenCalledWith({
+      next: '/',
+      bootstrap: false,
+      oidcEnabled: false,
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+  });
+
+  it('fails closed when auth status omits the self-service password-reset capability', async () => {
+    installSignedOutAuthStatus();
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(renderAuthMock).toHaveBeenCalledWith(expect.objectContaining({
+      selfServicePasswordResetEnabled: false,
+    }));
+  });
+
+  it('passes the capability to the board-401 auth fallback', async () => {
+    window.history.replaceState({}, '', '/sample-board');
+    installSignedOutAuthStatus(true);
+    renderBoardMock.mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { status: 401 }));
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(renderAuthMock).toHaveBeenCalledWith({
+      next: '/sample-board',
+      bootstrap: false,
+      oidcEnabled: false,
+      localAuthEnabled: true,
+      selfServicePasswordResetEnabled: true,
+    });
+  });
+
+	it('does not render the direct local reset page when local authentication is disabled', async () => {
+	  window.history.replaceState({}, '', '/auth/reset-password?token=secret');
+	  apiFetchMock.mockImplementation(async (url: string) => {
+	    if (url === '/api/auth/status') return { user: null, bootstrapAvailable: false, mode: 'full', oidcEnabled: true, localAuthEnabled: false, selfServicePasswordResetEnabled: false };
+	    throw new Error(`unexpected apiFetch url: ${url}`);
+	  });
+	  const mod = await loadRouterModule();
+	  await mod.router();
+	  expect(renderResetPasswordMock).not.toHaveBeenCalled();
+	  expect(renderAuthMock).toHaveBeenCalledWith(expect.objectContaining({ oidcEnabled: true, localAuthEnabled: false, selfServicePasswordResetEnabled: false }));
+	});
+});
+
+describe('router cold-start boardData handoff', () => {
+  const staleBoard = {
+    project: { id: 1, slug: 'alpha', name: 'Alpha' },
+    columns: { backlog: [] },
+    columnsMeta: {},
+    tags: [],
+    workflow: [],
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    renderAuthMock.mockReset();
+    renderResetPasswordMock.mockReset();
+    renderProjectsMock.mockReset();
+    renderDashboardMock.mockReset();
+    renderBoardMock.mockReset();
+    renderBoardMock.mockResolvedValue(undefined);
+    renderNotFoundMock.mockReset();
+    stopBoardEventsMock.mockReset();
+    startGlobalRealtimeMock.mockReset();
+    stopGlobalRealtimeMock.mockReset();
+    initForegroundLifecycleMock.mockReset();
+    hydrateNotificationsForUserMock.mockReset();
+    initNotificationBadgeMock.mockReset();
+    unsubscribeFromPushMock.mockReset();
+    unsubscribeFromPushMock.mockResolvedValue(undefined);
+    maybeAutoSubscribePushAfterLoginMock.mockClear();
+    loadUserThemeMock.mockClear();
+    applyWallpaperForAuthContextMock.mockClear();
+    loadUserWallpaperMock.mockClear();
+    hydrateVoiceFlowEnabledFromServerMock.mockClear();
+    hydrateVoiceFlowHandsFreeConfirmationFromServerMock.mockClear();
+    hydrateVoiceFlowModeFromServerMock.mockClear();
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user: userStatus(),
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return userStatus();
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return {};
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('ignores stale history.state.boardData on cold document load (F5)', async () => {
+    window.history.replaceState({ boardData: staleBoard }, '', '/alpha');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(renderBoardMock).toHaveBeenCalledTimes(1);
+    const opts = renderBoardMock.mock.calls[0][9];
+    expect(opts?.prefetchedBoard).toBeUndefined();
+    expect((window.history.state as { boardData?: unknown } | null)?.boardData).toBeUndefined();
+  });
+
+  it('still uses history.state.boardData for same-session navigations after cold start', async () => {
+    window.history.replaceState({}, '', '/');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(renderProjectsMock).toHaveBeenCalledTimes(1);
+
+    window.history.pushState({ boardData: staleBoard }, '', '/alpha');
+    await mod.router();
+
+    expect(renderBoardMock).toHaveBeenCalledTimes(1);
+    const opts = renderBoardMock.mock.calls[0][9];
+    expect(opts?.prefetchedBoard).toEqual(staleBoard);
+  });
+});
+
+describe('router wrap lanes hydration', () => {
+  function userBob() {
+    return {
+      id: 8,
+      email: 'bob@example.com',
+      name: 'Bob',
+      isBootstrap: false,
+      systemRole: 'user',
+      twoFactorEnabled: false,
+    };
+  }
+
+  function installSignedInAuth(user: ReturnType<typeof userStatus>, wrapLanesValue: string): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return user;
+      }
+      if (url.includes('key=wrapLanes')) {
+        return { value: wrapLanesValue };
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    renderProjectsMock.mockReset();
+    renderProjectsMock.mockResolvedValue(undefined);
+    loadUserThemeMock.mockClear();
+    applyWallpaperForAuthContextMock.mockClear();
+    loadUserWallpaperMock.mockClear();
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('resets stale local true when signed-in server preference is missing', async () => {
+    const prefs = await import('./core/wrap-lanes-preferences.js');
+    localStorage.setItem(prefs.WRAP_LANES_STORAGE_KEY, 'true');
+    installSignedInAuth(userBob(), '');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(prefs.getWrapLanesPreference()).toBe(false);
+  });
+
+  it('does not carry wrap lanes from user A to user B on login', async () => {
+    const prefs = await import('./core/wrap-lanes-preferences.js');
+    localStorage.setItem(prefs.WRAP_LANES_STORAGE_KEY, 'true');
+    installSignedInAuth(userStatus(), 'true');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getWrapLanesPreference()).toBe(true);
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    installSignedInAuth(userBob(), '');
+    await mod.router();
+
+    expect(prefs.getWrapLanesPreference()).toBe(false);
+  });
+});
+
+describe('router agenda start of day hydration', () => {
+  function userBob() {
+    return {
+      id: 8,
+      email: 'bob@example.com',
+      name: 'Bob',
+      isBootstrap: false,
+      systemRole: 'user',
+      twoFactorEnabled: false,
+    };
+  }
+
+  function installSignedInAuth(user: ReturnType<typeof userStatus>, agendaStartOfDayValue: string): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return user;
+      }
+      if (url.includes('key=agendaStartOfDay')) {
+        return { value: agendaStartOfDayValue };
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    renderProjectsMock.mockReset();
+    renderProjectsMock.mockResolvedValue(undefined);
+    loadUserThemeMock.mockClear();
+    applyWallpaperForAuthContextMock.mockClear();
+    loadUserWallpaperMock.mockClear();
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('defaults missing server preference to 08:00', async () => {
+    const prefs = await import('./core/agenda-start-of-day-preferences.js');
+    localStorage.setItem(prefs.AGENDA_START_OF_DAY_STORAGE_KEY, '06:00');
+    installSignedInAuth(userBob(), '');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('08:00');
+  });
+
+  it('does not carry start of day from user A to user B on login', async () => {
+    const prefs = await import('./core/agenda-start-of-day-preferences.js');
+    localStorage.setItem(prefs.AGENDA_START_OF_DAY_STORAGE_KEY, '06:00');
+    installSignedInAuth(userStatus(), '06:00');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('06:00');
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    installSignedInAuth(userBob(), '');
+    await mod.router();
+
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('08:00');
+  });
+
+  it('keeps the same user start of day when preference hydration fails', async () => {
+    const prefs = await import('./core/agenda-start-of-day-preferences.js');
+    installSignedInAuth(userStatus(), '06:00');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('06:00');
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user: userStatus(),
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return userStatus();
+      }
+      if (url.includes('key=agendaStartOfDay')) {
+        throw new Error('network');
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+    await mod.router();
+
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('06:00');
+  });
+
+  it('preserves same-user start of day on cold reload when hydration fails', async () => {
+    const prefs = await import('./core/agenda-start-of-day-preferences.js');
+    const user = userStatus();
+    localStorage.setItem(prefs.AGENDA_START_OF_DAY_STORAGE_KEY, '06:00');
+    localStorage.setItem(prefs.AGENDA_START_OF_DAY_OWNER_KEY, String(user.id));
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return user;
+      }
+      if (url.includes('key=agendaStartOfDay')) {
+        throw new Error('network');
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('06:00');
+    expect(localStorage.getItem(prefs.AGENDA_START_OF_DAY_STORAGE_KEY)).toBe('06:00');
+    expect(localStorage.getItem(prefs.AGENDA_START_OF_DAY_OWNER_KEY)).toBe(String(user.id));
+  });
+
+  it('does not leak start of day to another user when their hydration fails', async () => {
+    const prefs = await import('./core/agenda-start-of-day-preferences.js');
+    installSignedInAuth(userStatus(), '06:00');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('06:00');
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user: userBob(),
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return userBob();
+      }
+      if (url.includes('key=agendaStartOfDay')) {
+        throw new Error('network');
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+    await mod.router();
+
+    expect(prefs.getAgendaStartOfDayPreference()).toBe('08:00');
+  });
+});
+
+describe('router agenda now-line hydration', () => {
+  function userBob() {
+    return {
+      id: 8,
+      email: 'bob@example.com',
+      name: 'Bob',
+      isBootstrap: false,
+      systemRole: 'user',
+      twoFactorEnabled: false,
+    };
+  }
+
+  function installSignedInAuth(user: ReturnType<typeof userStatus>, agendaNowLineValue: string): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return user;
+      }
+      if (url.includes('key=agendaNowLine')) {
+        return { value: agendaNowLineValue };
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    renderProjectsMock.mockReset();
+    renderProjectsMock.mockResolvedValue(undefined);
+    loadUserThemeMock.mockClear();
+    applyWallpaperForAuthContextMock.mockClear();
+    loadUserWallpaperMock.mockClear();
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('defaults missing server preference to subtle', async () => {
+    const prefs = await import('./core/agenda-now-line-preferences.js');
+    localStorage.setItem(prefs.AGENDA_NOW_LINE_STORAGE_KEY, 'prominent');
+    installSignedInAuth(userBob(), '');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(prefs.getAgendaNowLinePreference()).toBe('subtle');
+  });
+
+  it('does not carry prominent now line from user A to user B on login', async () => {
+    const prefs = await import('./core/agenda-now-line-preferences.js');
+    localStorage.setItem(prefs.AGENDA_NOW_LINE_STORAGE_KEY, 'prominent');
+    installSignedInAuth(userStatus(), 'prominent');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getAgendaNowLinePreference()).toBe('prominent');
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    installSignedInAuth(userBob(), '');
+    await mod.router();
+
+    expect(prefs.getAgendaNowLinePreference()).toBe('subtle');
+  });
+});
+
+describe('router board todo sort hydration', () => {
+  function userBob() {
+    return {
+      id: 8,
+      email: 'bob@example.com',
+      name: 'Bob',
+      isBootstrap: false,
+      systemRole: 'user',
+      twoFactorEnabled: false,
+    };
+  }
+
+  function installSignedInAuth(user: ReturnType<typeof userStatus>, boardTodoSortValue: string): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user,
+          bootstrapAvailable: false,
+          mode: 'full',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      if (url === '/api/me') {
+        return user;
+      }
+      if (url.includes('key=boardTodoSort')) {
+        return { value: boardTodoSortValue };
+      }
+      if (url.startsWith('/api/user/preferences?key=')) {
+        return { value: '' };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  function installAnonymousAuth(): void {
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/auth/status') {
+        return {
+          user: null,
+          bootstrapAvailable: false,
+          mode: 'anonymous',
+          pushConfigured: false,
+          selfServicePasswordResetEnabled: false,
+          oidcEnabled: false,
+          localAuthEnabled: true,
+          wallEnabled: false,
+          markdownNotesEnabled: false,
+          mermaidNotesEnabled: false,
+        };
+      }
+      throw new Error(`unexpected apiFetch url: ${url}`);
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetModules();
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    apiFetchMock.mockReset();
+    renderProjectsMock.mockReset();
+    renderProjectsMock.mockResolvedValue(undefined);
+    renderBoardMock.mockReset();
+    renderBoardMock.mockResolvedValue(undefined);
+    loadUserThemeMock.mockClear();
+    applyWallpaperForAuthContextMock.mockClear();
+    loadUserWallpaperMock.mockClear();
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('applies saved newest to a board URL with no sort before render', async () => {
+    window.history.replaceState({}, '', '/alpha');
+    installSignedInAuth(userStatus(), 'newest');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(new URL(window.location.href).searchParams.get('sort')).toBe('newest');
+    expect(renderBoardMock).toHaveBeenCalledTimes(1);
+    expect(renderBoardMock.mock.calls[0][5]).toBe('newest');
+  });
+
+  it('applies saved oldest to a board URL with no sort before render', async () => {
+    window.history.replaceState({}, '', '/alpha');
+    installSignedInAuth(userStatus(), 'oldest');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(new URL(window.location.href).searchParams.get('sort')).toBe('oldest');
+    expect(renderBoardMock.mock.calls[0][5]).toBe('oldest');
+  });
+
+  it('leaves a board URL without sort when the saved preference is default', async () => {
+    window.history.replaceState({}, '', '/alpha');
+    installSignedInAuth(userStatus(), 'default');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(new URL(window.location.href).searchParams.get('sort')).toBeNull();
+    expect(renderBoardMock.mock.calls[0][5]).toBeNull();
+  });
+
+  it('lets an explicit sort=oldest override a saved newest without overwriting the preference', async () => {
+    window.history.replaceState({}, '', '/alpha?sort=oldest');
+    installSignedInAuth(userStatus(), 'newest');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    const prefs = await import('./core/board-sort-preferences.js');
+    expect(new URL(window.location.href).searchParams.get('sort')).toBe('oldest');
+    expect(renderBoardMock.mock.calls[0][5]).toBe('oldest');
+    expect(prefs.getBoardTodoSortPreference()).toBe('newest');
+    expect(apiFetchMock.mock.calls.some((call) => call[0] === '/api/user/preferences' && call[1]?.method === 'PUT')).toBe(false);
+  });
+
+  it('does not let an invalid sort query override a saved newest preference', async () => {
+    window.history.replaceState({}, '', '/alpha?sort=bogus');
+    installSignedInAuth(userStatus(), 'newest');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    const prefs = await import('./core/board-sort-preferences.js');
+    expect(new URL(window.location.href).searchParams.get('sort')).toBe('newest');
+    expect(renderBoardMock.mock.calls[0][5]).toBe('newest');
+    expect(prefs.getBoardTodoSortPreference()).toBe('newest');
+    expect(apiFetchMock.mock.calls.some((call) => call[0] === '/api/user/preferences' && call[1]?.method === 'PUT')).toBe(false);
+  });
+
+  it('leaves an invalid sort query alone when the saved preference is default', async () => {
+    window.history.replaceState({}, '', '/alpha?sort=bogus');
+    installSignedInAuth(userStatus(), 'default');
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    const prefs = await import('./core/board-sort-preferences.js');
+    expect(new URL(window.location.href).searchParams.get('sort')).toBe('bogus');
+    expect(renderBoardMock.mock.calls[0][5]).toBe('bogus');
+    expect(prefs.getBoardTodoSortPreference()).toBe('default');
+    expect(apiFetchMock.mock.calls.some((call) => call[0] === '/api/user/preferences' && call[1]?.method === 'PUT')).toBe(false);
+  });
+
+  it('keeps URL-only sort behavior when there is no authenticated user', async () => {
+    const prefs = await import('./core/board-sort-preferences.js');
+    localStorage.setItem(prefs.BOARD_TODO_SORT_STORAGE_KEY, 'newest');
+    window.history.replaceState({}, '', '/alpha');
+    installAnonymousAuth();
+    const mod = await loadRouterModule();
+
+    await mod.router();
+
+    expect(new URL(window.location.href).searchParams.get('sort')).toBeNull();
+    expect(renderBoardMock.mock.calls[0][5]).toBeNull();
+    expect(apiFetchMock.mock.calls.some((call) => typeof call[0] === 'string' && call[0].includes('key=boardTodoSort'))).toBe(false);
+  });
+
+  it('does not carry board todo sort from user A to user B on login', async () => {
+    const prefs = await import('./core/board-sort-preferences.js');
+    localStorage.setItem(prefs.BOARD_TODO_SORT_STORAGE_KEY, 'newest');
+    installSignedInAuth(userStatus(), 'newest');
+    const mod = await loadRouterModule();
+    await mod.router();
+    expect(prefs.getBoardTodoSortPreference()).toBe('newest');
+
+    const mutations = await import('./state/mutations.js');
+    mutations.setAuthStatusChecked(false);
+    installSignedInAuth(userBob(), '');
+    window.history.replaceState({}, '', '/alpha');
+    await mod.router();
+
+    expect(prefs.getBoardTodoSortPreference()).toBe('default');
+    expect(new URL(window.location.href).searchParams.get('sort')).toBeNull();
+    expect(renderBoardMock.mock.calls.at(-1)?.[5]).toBeNull();
   });
 });

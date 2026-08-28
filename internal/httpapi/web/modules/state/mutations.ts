@@ -1,7 +1,7 @@
 import { apiFetch } from '../api.js';
 import { current } from './state.js';
 import { getUser } from './selectors.js';
-import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus } from '../types.js';
+import { Board, Project, Todo, User, ProjectView, MobileTab, RouteName, DashboardSummary, DashboardTodo, TodoStatus, WebPushStatus, EmailNotifyPreferenceState } from '../types.js';
 import type { BoardMember } from './state.js';
 
 const DEFAULT_LANE_META = (): Record<TodoStatus, { hasMore: boolean; nextCursor: string | null; loading: boolean; totalCount?: number }> => ({});
@@ -100,6 +100,22 @@ export function setBootstrapAvailable(available: boolean | undefined): void {
 
 export function setPushConfigured(enabled: boolean): void {
   current._pushConfigured = enabled;
+}
+
+export function setPushStatus(status: WebPushStatus | null | undefined): void {
+  current._pushStatus = status ?? null;
+}
+
+export function setSelfServicePasswordResetEnabled(enabled: boolean): void {
+  current._selfServicePasswordResetEnabled = enabled;
+}
+
+export function setEmailNotifyAvailable(available: boolean): void {
+  current._emailNotifyAvailable = available;
+}
+
+export function setEmailNotifyPreferenceState(state: EmailNotifyPreferenceState): void {
+  current.emailNotifyPreference = state;
 }
 
 export function setOidcEnabled(enabled: boolean): void {
@@ -260,6 +276,8 @@ export function resetUserScopedState(): void {
   current.autocompleteSuggestion = null;
   current.openTodoSegment = null;
   current.settingsProjectId = null;
+  current._pushStatus = null;
+  current.emailNotifyPreference = { userId: null, status: 'idle', value: null };
   current.tagColors = {};
   current.backupData = undefined;
   current.backupPreview = undefined;

@@ -1,0 +1,46 @@
+package httpapi
+
+import (
+	"context"
+	"log"
+)
+
+const defaultMailQueueCapacity = 1024
+
+// mailDelivery is one queued outbound email.
+type mailDelivery struct {
+	To      string
+	Subject string
+	Body    string
+	// LogRef is a non-sensitive identifier for log correlation (e.g.
+	// "password-reset user=123"), never the email address or token.
+	LogRef string
+	// Prepare defers recipient authorization, preference selection, address
+	// lookup, and sensitive rendering until each actual send attempt. A false
+	// result drops the best-effort notification without retrying.
+	Prepare func(context.Context) (mailDelivery, bool, error)
+}
+
+func (d mailDelivery) logRef() string { return d.LogRef }
+
+type mailQueue = deliveryQueue[mailDelivery]
+
+func newMailQueue(logger *log.Logger) *mailQueue {
+	return newMailQueueWithCapacityAndKind(logger, defaultMailQueueCapacity, "mail")
+}
+
+func newMailQueueWithCapacity(logger *log.Logger, capacity int) *mailQueue {
+	return newMailQueueWithCapacityAndKind(logger, capacity, "mail")
+}
+
+func newTransactionalMailQueue(logger *log.Logger) *mailQueue {
+	return newMailQueueWithCapacityAndKind(logger, defaultMailQueueCapacity, "transactional mail")
+}
+
+func newNotificationMailQueue(logger *log.Logger) *mailQueue {
+	return newMailQueueWithCapacityAndKind(logger, defaultMailQueueCapacity, "notification mail")
+}
+
+func newMailQueueWithCapacityAndKind(logger *log.Logger, capacity int, kind string) *mailQueue {
+	return newDeliveryQueue[mailDelivery](logger, capacity, kind)
+}

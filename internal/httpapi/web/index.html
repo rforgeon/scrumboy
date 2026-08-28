@@ -202,11 +202,18 @@
             <option value="40">40</option>
           </select>
         </label>
+
+        <label class="field">
+          <div class="field__label" data-i18n-text="todo.fields.priority">Priority</div>
+          <select class="select" id="todoPriority" name="priorityKey">
+            <option value="" data-i18n-text="todo.priority.none">No priority</option>
+          </select>
+        </label>
         </div>
 
         <div class="dialog__footer">
           <button class="btn btn--danger" type="button" id="deleteTodoBtn" data-i18n-text="common.delete">Delete</button>
-          <div class="todo-dialog-dates muted" id="todoDialogCreated" aria-hidden="true"><span class="todo-dialog-datetime-value"></span></div>
+          <div class="todo-dialog-dates muted" id="todoDialogCreated" aria-hidden="true"><span class="todo-dialog-datetime-value"></span><span class="todo-dialog-createdby" id="todoDialogCreatedBy"></span></div>
           <button class="btn" type="submit" value="save" id="saveTodoBtn" data-i18n-text="common.save">Save</button>
           <button class="btn btn--ghost todo-share-btn" type="button" id="shareTodoBtn" aria-label="Share story link" data-i18n-aria-label="todo.links.shareAriaLabel">↗</button>
         </div>

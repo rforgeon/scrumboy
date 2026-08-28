@@ -135,6 +135,14 @@ const enCatalog = {
   "settings.customization.theme.option.system": "System",
   "settings.customization.theme.option.dark": "Dark",
   "settings.customization.theme.option.light": "Light",
+  "settings.customization.cardsPerLane.title": "Cards per lane",
+  "settings.customization.cardsPerLane.description": "Number of cards shown by default in each lane before \"Load more\" is needed.",
+  "settings.customization.cardsPerLane.signInHint": "Sign in to save this preference.",
+  "settings.customization.cardsPerLane.toast.updated": "Cards per lane updated",
+  "settings.customization.cardsPerLane.toast.updateFailed": "Failed to update cards per lane",
+  "settings.customization.wrapLanes.title": "Wrap lanes into rows",
+  "settings.customization.wrapLanes.description": "On wide screens, boards with more than five lanes split into two equal rows; a leftover odd lane sits alone on the next row.",
+  "settings.customization.wrapLanes.toggleLabel": "Wrap lanes into rows",
   "settings.customization.notifications.title": "Desktop notifications",
   "settings.customization.notifications.description": "OS-level alerts when someone assigns you a todo (works when this tab is in the background).",
   "settings.customization.notifications.status.default": "Not enabled yet — click the button below (your browser will ask for permission).",
@@ -163,6 +171,14 @@ const deCatalog = {
   "settings.customization.theme.option.system": "System",
   "settings.customization.theme.option.dark": "Dunkel",
   "settings.customization.theme.option.light": "Hell",
+  "settings.customization.cardsPerLane.title": "Karten pro Spalte",
+  "settings.customization.cardsPerLane.description": "Standardmäßig angezeigte Anzahl an Karten pro Spalte, bevor „Mehr laden“ erforderlich ist.",
+  "settings.customization.cardsPerLane.signInHint": "Melde dich an, um diese Einstellung zu speichern.",
+  "settings.customization.cardsPerLane.toast.updated": "Karten pro Spalte aktualisiert",
+  "settings.customization.cardsPerLane.toast.updateFailed": "Karten pro Spalte konnten nicht aktualisiert werden",
+  "settings.customization.wrapLanes.title": "Spalten in Zeilen umbrechen",
+  "settings.customization.wrapLanes.description": "Auf breiten Bildschirmen teilen sich Boards mit mehr als fünf Spalten in zwei gleich große Zeilen; eine übrig gebliebene ungerade Spalte steht allein in der nächsten Zeile.",
+  "settings.customization.wrapLanes.toggleLabel": "Spalten in Zeilen umbrechen",
   "settings.customization.notifications.title": "Desktop-Benachrichtigungen",
   "settings.customization.notifications.description": "Systemweite Hinweise, wenn dir jemand ein Todo zuweist (funktioniert, wenn dieser Tab im Hintergrund ist).",
   "settings.customization.notifications.status.default": "Noch nicht aktiviert — klicke auf die Schaltfläche unten (dein Browser fragt nach Berechtigung).",
@@ -191,6 +207,14 @@ const pseudoCatalog = {
   "settings.customization.theme.option.system": "[!! System !!]",
   "settings.customization.theme.option.dark": "[!! Dark !!]",
   "settings.customization.theme.option.light": "[!! Light !!]",
+  "settings.customization.cardsPerLane.title": "[!! Cards per lane !!]",
+  "settings.customization.cardsPerLane.description": "[!! Number of cards shown by default in each lane before \"Load more\" is needed. !!]",
+  "settings.customization.cardsPerLane.signInHint": "[!! Sign in to save this preference. !!]",
+  "settings.customization.cardsPerLane.toast.updated": "[!! Cards per lane updated !!]",
+  "settings.customization.cardsPerLane.toast.updateFailed": "[!! Failed to update cards per lane !!]",
+  "settings.customization.wrapLanes.title": "[!! Wrap lanes into rows !!]",
+  "settings.customization.wrapLanes.description": "[!! On wide screens, boards with more than five lanes split into two equal rows; a leftover odd lane sits alone on the next row. !!]",
+  "settings.customization.wrapLanes.toggleLabel": "[!! Wrap lanes into rows !!]",
   "settings.customization.notifications.title": "[!! Desktop notifications !!]",
   "settings.customization.notifications.description": "[!! OS-level alerts when someone assigns you a todo (works when this tab is in the background). !!]",
   "settings.customization.notifications.status.default": "[!! Not enabled yet — click the button below (your browser will ask for permission). !!]",
@@ -378,6 +402,27 @@ describe('settings language selector', () => {
     }
   });
 
+  it('does not pin the open settings locale list with fixed positioning', async () => {
+    const { settings, cleanup } = await setupCustomizationSettings();
+    try {
+      await settings.renderSettingsModal();
+
+      const button = getSettingsLocalePicker();
+      button.click();
+
+      const list = button.closest('.locale-picker')?.querySelector('.locale-picker__list') as HTMLUListElement;
+      expect(list.hidden).toBe(false);
+      expect(list.style.position).toBe('');
+      expect(list.style.top).toBe('');
+      expect(list.style.left).toBe('');
+      expect(list.style.right).toBe('');
+      expect(list.style.minWidth).toBe('');
+      expect(list.style.zIndex).toBe('');
+    } finally {
+      cleanup();
+    }
+  });
+
   it('selecting German persists locale, updates lang, and hydrates migrated shell text', async () => {
     const { i18n, settings, cleanup } = await setupCustomizationSettings();
     try {
@@ -389,6 +434,7 @@ describe('settings language selector', () => {
 
       expect(i18n.getLocale()).toBe('de');
       expect(localStorage.getItem(i18n.LOCALE_STORAGE_KEY)).toBe('de');
+      expect(document.cookie).toContain(`${i18n.LOCALE_STORAGE_KEY}=de`);
       expect(document.documentElement.lang).toBe('de');
       expect(document.documentElement.getAttribute('data-locale')).toBe('de');
       expect(document.getElementById('shellProbe')?.textContent).toBe('Shell-Text');

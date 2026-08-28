@@ -9,8 +9,96 @@ import (
 	"strings"
 	"time"
 
+	priorityapp "scrumboy/internal/application/priority"
+	projectapp "scrumboy/internal/application/project"
+	projectsettingsapp "scrumboy/internal/application/projectsettings"
+	sprintapp "scrumboy/internal/application/sprint"
+	tagapp "scrumboy/internal/application/tag"
+	todoapp "scrumboy/internal/application/todo"
+	todolinkapp "scrumboy/internal/application/todolink"
+	workflowapp "scrumboy/internal/application/workflow"
 	"scrumboy/internal/store"
 )
+
+func writeWorkflowMutationPrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, workflowapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, workflowapp.ErrMaintainerRequired):
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+	default:
+		writeInternal(w, err)
+	}
+}
+
+func writePriorityMutationPrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, priorityapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, priorityapp.ErrMaintainerRequired):
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+	default:
+		writeInternal(w, err)
+	}
+}
+
+func writeTagColorPrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, tagapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	default:
+		writeInternal(w, err)
+	}
+}
+
+func writeTagDeletionError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, tagapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, tagapp.ErrNameDeletionNotAllowed):
+		writeValidationError(w, "name-based delete not allowed for durable projects; use /tags/id/{tagId}", "name_based_tag_route_not_allowed", nil)
+	case errors.Is(err, tagapp.ErrInvalidDeletionProjectKind):
+		writeInternal(w, err)
+	default:
+		writeStoreErr(w, err, true)
+	}
+}
+
+func resolvedRESTTagProject(project store.Project) tagapp.ResolvedProject {
+	kind := tagapp.DurableProject
+	if project.ExpiresAt != nil {
+		kind = tagapp.AnonymousTemporaryBoard
+		if project.CreatorUserID != nil {
+			kind = tagapp.CreatorOwnedTemporaryBoard
+		}
+	}
+
+	return tagapp.ResolvedProject{ProjectID: project.ID, Kind: kind}
+}
+
+func writeSprintDefinitionPrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sprintapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, sprintapp.ErrMaintainerRequired):
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+	default:
+		writeInternal(w, err)
+	}
+}
+
+func writeSprintLifecyclePrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sprintapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, sprintapp.ErrMaintainerRequired):
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+	case errors.Is(err, sprintapp.ErrSprintNotInProject):
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+	default:
+		writeStoreErr(w, err, true)
+	}
+}
 
 func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request, rest []string) {
 	if len(rest) == 0 {
@@ -24,6 +112,10 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request, rest []stri
 		return
 	}
 
+	if s.handleSlugBoardRead(w, r, rest, slug) {
+		return
+	}
+
 	pc, err := s.store.GetProjectContextBySlug(s.requestContext(r), slug, s.storeMode())
 	if err != nil {
 		writeStoreErr(w, err, true)
@@ -33,10 +125,13 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request, rest []stri
 	if s.handleBoardReadEventsAndSettings(w, r, rest, &pc) {
 		return
 	}
+	if s.handleBoardCalendarRoutes(w, r, rest, &pc) {
+		return
+	}
 	if s.handleBoardWorkflowRoutes(w, r, rest, &pc) {
 		return
 	}
-	if s.handleBoardLaneRoutes(w, r, rest, &pc) {
+	if s.handleBoardPriorityRoutes(w, r, rest, &pc) {
 		return
 	}
 	if s.handleBoardClaimRoute(w, r, rest, &pc) {
@@ -67,6 +162,17 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request, rest []stri
 	writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
 }
 
+func writeBoardSettingsPrepareError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, projectsettingsapp.ErrActorRequired):
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+	case errors.Is(err, projectsettingsapp.ErrDurableRequired):
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+	default:
+		writeStoreErr(w, err, true)
+	}
+}
+
 func (s *Server) handleBoardReadEventsAndSettings(w http.ResponseWriter, r *http.Request, rest []string, pc *store.ProjectContext) bool {
 	project := pc.Project
 
@@ -76,83 +182,60 @@ func (s *Server) handleBoardReadEventsAndSettings(w http.ResponseWriter, r *http
 		return true
 	}
 
-	// GET /api/board/{slug}
-	// Always use paged response (default limitPerLane=20) so mobile and cached clients get columnsMeta and limited items.
-	if len(rest) == 1 && r.Method == http.MethodGet {
-		tag := r.URL.Query().Get("tag")
-		search := strings.TrimSpace(r.URL.Query().Get("search"))
-		if search == "" {
-			search = ""
-		}
-		hasSprints, err := s.store.HasSprints(s.requestContext(r), project.ID)
-		if err != nil {
-			writeStoreErr(w, err, true)
-			return true
-		}
-		var sprintFilter store.SprintFilter
-		if !hasSprints {
-			sprintFilter = store.SprintFilter{Mode: "none"}
-		} else {
-			sprintFilter, err = s.parseSprintFilterFromQuery(r, project.ID)
-			if err != nil {
-				writeValidationError(w, err.Error(), "invalid_sprint_id", map[string]any{"field": "sprintId"})
-				return true
-			}
-		}
-		limitPerLane := 20
-		if v := r.URL.Query().Get("limitPerLane"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				limitPerLane = n
-			}
-		}
-		project2, tags, workflow, cols, meta, err := s.store.GetBoardPaged(s.requestContext(r), pc, tag, search, sprintFilter, limitPerLane)
-		if err != nil {
-			writeStoreErr(w, err, true)
-			return true
-		}
-		writeJSON(w, http.StatusOK, boardToJSONWithMeta(project2, workflow, tags, cols, meta))
-		return true
-	}
-
 	// PATCH /api/board/{slug}/settings - update board/project-level settings.
 	if len(rest) == 2 && rest[1] == "settings" && r.Method == http.MethodPatch {
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-			return true
-		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+		prepared, err := s.boardSettings.Prepare(ctx, projectsettingsapp.ResolvedRESTTarget{ProjectID: project.ID})
+		if err != nil {
+			writeBoardSettingsPrepareError(w, err)
 			return true
 		}
 
 		var in struct {
-			DefaultSprintWeeks *int `json:"defaultSprintWeeks"`
+			DefaultSprintWeeks *int    `json:"defaultSprintWeeks"`
+			SprintsEnabled     *bool   `json:"sprintsEnabled"`
+			AgendaEnabled      *bool   `json:"agendaEnabled"`
+			AgendaTimezone     *string `json:"agendaTimezone"`
+			AgendaTitle        *string `json:"agendaTitle"`
+			AgendaColor        *string `json:"agendaColor"`
 		}
 		if err := readJSON(w, r, s.maxBody, &in); err != nil {
 			return true
 		}
-		if in.DefaultSprintWeeks == nil {
+		if in.DefaultSprintWeeks == nil && in.SprintsEnabled == nil && in.AgendaEnabled == nil && in.AgendaTimezone == nil && in.AgendaTitle == nil && in.AgendaColor == nil {
 			writeValidationError(w, "defaultSprintWeeks required", "default_sprint_weeks_required", map[string]any{"field": "defaultSprintWeeks"})
 			return true
 		}
-		if *in.DefaultSprintWeeks != 1 && *in.DefaultSprintWeeks != 2 {
+		if in.DefaultSprintWeeks != nil && *in.DefaultSprintWeeks != 1 && *in.DefaultSprintWeeks != 2 {
 			writeValidationError(w, "defaultSprintWeeks must be 1 or 2", "invalid_default_sprint_weeks", map[string]any{"field": "defaultSprintWeeks"})
 			return true
 		}
-		if project.DefaultSprintWeeks == *in.DefaultSprintWeeks {
-			writeJSON(w, http.StatusOK, map[string]any{"defaultSprintWeeks": *in.DefaultSprintWeeks})
+		view, err := prepared.Patch(projectsettingsapp.PatchCommand{
+			DefaultSprintWeeks: in.DefaultSprintWeeks,
+			SprintsEnabled:     in.SprintsEnabled,
+			AgendaEnabled:      in.AgendaEnabled,
+			AgendaTimezone:     in.AgendaTimezone,
+			AgendaTitle:        in.AgendaTitle,
+			AgendaColor:        in.AgendaColor,
+		})
+		if err != nil {
+			writeBoardSettingsPrepareError(w, err)
 			return true
 		}
-
-		if err := s.store.UpdateProjectDefaultSprintWeeks(ctx, project.ID, userID, *in.DefaultSprintWeeks); err != nil {
-			writeStoreErr(w, err, true)
-			return true
+		resp := map[string]any{}
+		if in.AgendaEnabled != nil || in.AgendaTimezone != nil || in.AgendaTitle != nil || in.AgendaColor != nil {
+			resp["agendaEnabled"] = view.AgendaEnabled
+			resp["agendaTimezone"] = view.AgendaTimezone
+			resp["agendaTitle"] = view.AgendaTitle
+			resp["agendaColor"] = view.AgendaColor
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "project_settings_updated")
-		writeJSON(w, http.StatusOK, map[string]any{"defaultSprintWeeks": *in.DefaultSprintWeeks})
+		if in.DefaultSprintWeeks != nil {
+			resp["defaultSprintWeeks"] = view.DefaultSprintWeeks
+		}
+		if in.SprintsEnabled != nil {
+			resp["sprintsEnabled"] = view.SprintsEnabled
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return true
 	}
 
@@ -193,14 +276,11 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 	// POST /api/board/{slug}/workflow - add a new non-done lane before done.
 	if len(rest) == 2 && rest[1] == "workflow" && r.Method == http.MethodPost {
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-			return true
-		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+		prepared, err := s.workflowMutations.Prepare(ctx, workflowapp.ResolvedRESTMutationTarget{
+			ProjectID: project.ID,
+		})
+		if err != nil {
+			writeWorkflowMutationPrepareError(w, err)
 			return true
 		}
 
@@ -220,12 +300,11 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 			return true
 		}
 
-		col, err := s.store.AddWorkflowColumn(ctx, project.ID, in.Name)
+		col, err := prepared.Create(workflowapp.CreateCommand{Name: in.Name})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "workflow_column_added")
 		writeJSON(w, http.StatusCreated, workflowColumnJSON{
 			Key:      col.Key,
 			Name:     col.Name,
@@ -239,14 +318,11 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 	// PATCH /api/board/{slug}/workflow/{key} - update workflow lane label and color.
 	if len(rest) == 3 && rest[1] == "workflow" && r.Method == http.MethodPatch {
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-			return true
-		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+		prepared, err := s.workflowMutations.Prepare(ctx, workflowapp.ResolvedRESTMutationTarget{
+			ProjectID: project.ID,
+		})
+		if err != nil {
+			writeWorkflowMutationPrepareError(w, err)
 			return true
 		}
 		columnKey := strings.TrimSpace(rest[2])
@@ -280,11 +356,14 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 			writeValidationError(w, "invalid workflow column color", "invalid_workflow_column_color", map[string]any{"field": "color"})
 			return true
 		}
-		if err := s.store.UpdateWorkflowColumn(ctx, project.ID, columnKey, in.Name, in.Color); err != nil {
+		if err := prepared.Update(workflowapp.UpdateCommand{
+			Key:   columnKey,
+			Name:  in.Name,
+			Color: in.Color,
+		}); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "workflow_column_updated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -292,6 +371,51 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 	// DELETE /api/board/{slug}/workflow/{key} - delete an empty non-done lane.
 	if len(rest) == 3 && rest[1] == "workflow" && r.Method == http.MethodDelete {
 		ctx := s.requestContext(r)
+		prepared, err := s.workflowMutations.Prepare(ctx, workflowapp.ResolvedRESTMutationTarget{
+			ProjectID: project.ID,
+		})
+		if err != nil {
+			writeWorkflowMutationPrepareError(w, err)
+			return true
+		}
+		columnKey := strings.TrimSpace(rest[2])
+		if columnKey == "" {
+			writeValidationError(w, "invalid workflow key", "invalid_workflow_key", map[string]any{"field": "key"})
+			return true
+		}
+		if err := prepared.Delete(workflowapp.DeleteCommand{Key: columnKey}); err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+
+	return false
+}
+
+func (s *Server) handleBoardPriorityRoutes(w http.ResponseWriter, r *http.Request, rest []string, pc *store.ProjectContext) bool {
+	project := pc.Project
+	ctx := s.requestContext(r)
+
+	// Readers may list the same definitions already included in the initial board projection.
+	if len(rest) == 2 && rest[1] == "priorities" && r.Method == http.MethodGet {
+		priorities, err := s.store.GetProjectPriorities(ctx, project.ID)
+		if err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
+		items := make([]priorityTierJSON, 0, len(priorities))
+		for _, tier := range priorities {
+			items = append(items, priorityTierJSON{
+				Key: tier.Key, Name: tier.Name, Color: tier.Color, Position: tier.Position,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		return true
+	}
+
+	if len(rest) == 3 && rest[1] == "priorities" && rest[2] == "counts" && r.Method == http.MethodGet {
 		userID, ok := store.UserIDFromContext(ctx)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
@@ -302,16 +426,99 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
 			return true
 		}
-		columnKey := strings.TrimSpace(rest[2])
-		if columnKey == "" {
-			writeValidationError(w, "invalid workflow key", "invalid_workflow_key", map[string]any{"field": "key"})
-			return true
-		}
-		if err := s.store.DeleteWorkflowColumn(ctx, project.ID, columnKey); err != nil {
+		counts, err := s.store.CountTodosByPriorityKey(ctx, project.ID)
+		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "workflow_column_deleted")
+		if counts == nil {
+			counts = map[string]int{}
+		}
+		writeJSON(w, http.StatusOK, priorityTierCountsJSON{Slug: project.Slug, CountsByPriorityKey: counts})
+		return true
+	}
+
+	if len(rest) == 2 && rest[1] == "priorities" && r.Method == http.MethodPost {
+		prepared, err := s.priorityMutations.Prepare(ctx, priorityapp.ResolvedRESTMutationTarget{ProjectID: project.ID})
+		if err != nil {
+			writePriorityMutationPrepareError(w, err)
+			return true
+		}
+		var in struct {
+			Name string `json:"name"`
+		}
+		if err := readJSON(w, r, s.maxBody, &in); err != nil {
+			return true
+		}
+		in.Name = strings.TrimSpace(in.Name)
+		if in.Name == "" {
+			writeValidationError(w, "name required", "invalid_priority_tier_name", map[string]any{"field": "name"})
+			return true
+		}
+		if len(in.Name) > 200 {
+			writeValidationError(w, "invalid priority tier name", "invalid_priority_tier_name", map[string]any{"field": "name"})
+			return true
+		}
+		tier, err := prepared.Create(priorityapp.CreateCommand{Name: in.Name})
+		if err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
+		writeJSON(w, http.StatusCreated, priorityTierJSON{Key: tier.Key, Name: tier.Name, Color: tier.Color, Position: tier.Position})
+		return true
+	}
+
+	if len(rest) == 3 && rest[1] == "priorities" && r.Method == http.MethodPatch {
+		prepared, err := s.priorityMutations.Prepare(ctx, priorityapp.ResolvedRESTMutationTarget{ProjectID: project.ID})
+		if err != nil {
+			writePriorityMutationPrepareError(w, err)
+			return true
+		}
+		key := strings.TrimSpace(rest[2])
+		if key == "" {
+			writeValidationError(w, "invalid priority key", "invalid_priority_key", map[string]any{"field": "key"})
+			return true
+		}
+		var in struct {
+			Name  string `json:"name"`
+			Color string `json:"color"`
+		}
+		if err := readJSON(w, r, s.maxBody, &in); err != nil {
+			return true
+		}
+		in.Name = strings.TrimSpace(in.Name)
+		in.Color = strings.TrimSpace(in.Color)
+		if in.Name == "" || len(in.Name) > 200 {
+			writeValidationError(w, "invalid priority tier name", "invalid_priority_tier_name", map[string]any{"field": "name"})
+			return true
+		}
+		if !store.ValidWorkflowColumnColor(in.Color) {
+			writeValidationError(w, "invalid priority tier color", "invalid_priority_tier_color", map[string]any{"field": "color"})
+			return true
+		}
+		if err := prepared.Update(priorityapp.UpdateCommand{Key: key, Name: in.Name, Color: in.Color}); err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+
+	if len(rest) == 3 && rest[1] == "priorities" && r.Method == http.MethodDelete {
+		prepared, err := s.priorityMutations.Prepare(ctx, priorityapp.ResolvedRESTMutationTarget{ProjectID: project.ID})
+		if err != nil {
+			writePriorityMutationPrepareError(w, err)
+			return true
+		}
+		key := strings.TrimSpace(rest[2])
+		if key == "" {
+			writeValidationError(w, "invalid priority key", "invalid_priority_key", map[string]any{"field": "key"})
+			return true
+		}
+		if err := prepared.Delete(priorityapp.DeleteCommand{Key: key}); err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -319,46 +526,14 @@ func (s *Server) handleBoardWorkflowRoutes(w http.ResponseWriter, r *http.Reques
 	return false
 }
 
-func (s *Server) handleBoardLaneRoutes(w http.ResponseWriter, r *http.Request, rest []string, pc *store.ProjectContext) bool {
-	project := pc.Project
-
-	// GET /api/board/{slug}/lanes/{status}
-	if len(rest) != 3 || rest[1] != "lanes" || r.Method != http.MethodGet {
-		return false
-	}
-
-	columnKey := normalizeLaneKey(rest[2])
-	tag := r.URL.Query().Get("tag")
-	search := strings.TrimSpace(r.URL.Query().Get("search"))
-	sprintFilter, err := s.parseSprintFilterFromQuery(r, project.ID)
-	if err != nil {
-		writeValidationError(w, err.Error(), "invalid_sprint_id", map[string]any{"field": "sprintId"})
-		return true
-	}
-	limit := 20
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
-			limit = n
-		}
-	}
-	afterCursor := r.URL.Query().Get("afterCursor")
-	afterRank, afterID := store.ParseLaneCursor(afterCursor)
-
-	items, nextCursor, hasMore, err := s.store.ListTodosForBoardLane(s.requestContext(r), project.ID, columnKey, limit, afterRank, afterID, tag, search, sprintFilter)
-	if err != nil {
-		writeStoreErr(w, err, true)
-		return true
-	}
-	writeJSON(w, http.StatusOK, lanePageToJSON(items, nextCursor, hasMore))
-	return true
-}
-
 func (s *Server) handleBoardClaimRoute(w http.ResponseWriter, r *http.Request, rest []string, pc *store.ProjectContext) bool {
 	project := pc.Project
 
 	// POST /api/board/{slug}/claim
-	// Escape hatch: convert an unowned temporary board into an owned durable project.
-	// No UI assumptions; server-side only.
+	// Escape hatch: the recorded creator of a Full Mode Temporary Board converts it into a
+	// Durable Project (owned, non-expiring). Anonymous Boards (no creator) are never claimable.
+	// Disabled entirely in Anonymous Mode. No UI assumptions; server-side only. Authorization is
+	// enforced in the store (ClaimTemporaryBoard); any unauthorized/ineligible state returns 404.
 	if len(rest) != 2 || rest[1] != "claim" || r.Method != http.MethodPost {
 		return false
 	}
@@ -373,11 +548,14 @@ func (s *Server) handleBoardClaimRoute(w http.ResponseWriter, r *http.Request, r
 		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
 		return true
 	}
-	if err := s.store.ClaimTemporaryBoard(ctx, project.ID, userID); err != nil {
+	prepared := s.projectClaims.Prepare(ctx, projectapp.ClaimCommand{
+		ProjectID:   project.ID,
+		ActorUserID: userID,
+	})
+	if err := prepared.Claim(); err != nil {
 		writeStoreErr(w, err, true)
 		return true
 	}
-	s.emitRefreshNeeded(r.Context(), project.ID, "board_claimed")
 	w.WriteHeader(http.StatusNoContent)
 	return true
 }
@@ -396,6 +574,7 @@ func (s *Server) handleBoardTodoRoutes(w http.ResponseWriter, r *http.Request, r
 			EstimationPoints *int64   `json:"estimationPoints"`
 			SprintID         *int64   `json:"sprintId"`
 			AssigneeUserID   *int64   `json:"assigneeUserId"`
+			PriorityKey      *string  `json:"priorityKey"`
 			Position         *struct {
 				AfterID  *int64 `json:"afterId"`
 				BeforeID *int64 `json:"beforeId"`
@@ -413,23 +592,29 @@ func (s *Server) handleBoardTodoRoutes(w http.ResponseWriter, r *http.Request, r
 			columnKey = store.DefaultColumnBacklog
 		}
 
-		var afterID, beforeID *int64
+		position := todoapp.ResolvedCreatePosition{}
 		if in.Position != nil {
-			afterID = in.Position.AfterID
-			beforeID = in.Position.BeforeID
+			position.AfterTodoID = in.Position.AfterID
+			position.BeforeTodoID = in.Position.BeforeID
 		}
 
-		todo, err := s.store.CreateTodo(s.requestContext(r), project.ID, store.CreateTodoInput{
-			Title:            in.Title,
-			Body:             in.Body,
-			Tags:             in.Tags,
-			ColumnKey:        columnKey,
-			EstimationPoints: in.EstimationPoints,
-			SprintID:         in.SprintID,
-			AssigneeUserID:   in.AssigneeUserID,
-			AfterID:          afterID,
-			BeforeID:         beforeID,
-		}, s.storeMode())
+		prepared := s.todoCreates.Prepare(s.requestContext(r), todoapp.ResolvedCreateTarget{
+			ProjectContext: *pc,
+			Mode:           s.storeMode(),
+		})
+		result, err := prepared.Create(todoapp.CreateCommand{
+			Values: todoapp.CreateValues{
+				Title:            in.Title,
+				Body:             in.Body,
+				Tags:             in.Tags,
+				ColumnKey:        columnKey,
+				EstimationPoints: in.EstimationPoints,
+				AssigneeUserID:   in.AssigneeUserID,
+				SprintID:         in.SprintID,
+				PriorityKey:      in.PriorityKey,
+			},
+			Position: position,
+		})
 		if err != nil {
 			if errors.Is(err, store.ErrUnauthorized) {
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
@@ -438,10 +623,7 @@ func (s *Server) handleBoardTodoRoutes(w http.ResponseWriter, r *http.Request, r
 			writeStoreErr(w, err, true)
 			return true
 		}
-		if !todo.AssignmentChanged {
-			s.emitRefreshNeeded(r.Context(), project.ID, "todo_created")
-		}
-		writeJSON(w, http.StatusCreated, todoToJSON(todo))
+		writeJSON(w, http.StatusCreated, todoToJSONForProject(result.Todo, project))
 		return true
 	}
 
@@ -501,16 +683,41 @@ func (s *Server) handleBoardLinkRoutes(w http.ResponseWriter, r *http.Request, r
 		return true
 	}
 
-	if _, err := s.store.GetTodoByLocalID(s.requestContext(r), project.ID, localID, s.storeMode()); err != nil {
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
-		case errors.Is(err, store.ErrUnauthorized):
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
-		default:
-			writeStoreErr(w, err, true)
+	ctx := s.requestContext(r)
+	isAdd := len(rest) == 4 && r.Method == http.MethodPost
+	isRemove := len(rest) == 5 && r.Method == http.MethodDelete
+
+	var prepared *todolinkapp.PreparedRESTMutation
+	if isAdd || isRemove {
+		var err error
+		prepared, err = s.todoLinkMutations.Prepare(ctx, todolinkapp.ResolvedRESTMutationTarget{
+			ProjectID:     project.ID,
+			SourceLocalID: localID,
+			Mode:          s.storeMode(),
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+			case errors.Is(err, store.ErrUnauthorized):
+				writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
+			default:
+				writeStoreErr(w, err, true)
+			}
+			return true
 		}
-		return true
+	} else {
+		if _, err := s.store.GetTodoByLocalID(ctx, project.ID, localID, s.storeMode()); err != nil {
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+			case errors.Is(err, store.ErrUnauthorized):
+				writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
+			default:
+				writeStoreErr(w, err, true)
+			}
+			return true
+		}
 	}
 
 	switch {
@@ -548,7 +755,7 @@ func (s *Server) handleBoardLinkRoutes(w http.ResponseWriter, r *http.Request, r
 		})
 		return true
 
-	case len(rest) == 4 && r.Method == http.MethodPost:
+	case isAdd:
 		var in struct {
 			TargetLocalID int64  `json:"targetLocalId"`
 			LinkType      string `json:"linkType"`
@@ -568,7 +775,10 @@ func (s *Server) handleBoardLinkRoutes(w http.ResponseWriter, r *http.Request, r
 			in.LinkType = "relates_to"
 		}
 
-		if err := s.store.AddLink(s.requestContext(r), project.ID, localID, in.TargetLocalID, in.LinkType, s.storeMode()); err != nil {
+		if err := prepared.Add(todolinkapp.AddCommand{
+			TargetLocalID: in.TargetLocalID,
+			LinkType:      in.LinkType,
+		}); err != nil {
 			switch {
 			case errors.Is(err, store.ErrValidation):
 				writeValidationError(w, "invalid link", "invalid_link", nil)
@@ -581,17 +791,16 @@ func (s *Server) handleBoardLinkRoutes(w http.ResponseWriter, r *http.Request, r
 			}
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "todo_links_updated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 
-	case len(rest) == 5 && r.Method == http.MethodDelete:
+	case isRemove:
 		targetLocalID, ok := parseInt64(rest[4])
 		if !ok {
 			writeValidationError(w, "invalid targetLocalId", "invalid_target_local_id", map[string]any{"field": "targetLocalId"})
 			return true
 		}
-		if err := s.store.RemoveLink(s.requestContext(r), project.ID, localID, targetLocalID, s.storeMode()); err != nil {
+		if err := prepared.Remove(todolinkapp.RemoveCommand{TargetLocalID: targetLocalID}); err != nil {
 			switch {
 			case errors.Is(err, store.ErrUnauthorized):
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
@@ -602,7 +811,6 @@ func (s *Server) handleBoardLinkRoutes(w http.ResponseWriter, r *http.Request, r
 			}
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "todo_links_updated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 
@@ -633,7 +841,7 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 			}
 			return true
 		}
-		writeJSON(w, http.StatusOK, todoToJSON(todo))
+		writeJSON(w, http.StatusOK, todoToJSONForProject(todo, project))
 		return true
 	}
 
@@ -665,6 +873,7 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 				EstimationPoints *int64   `json:"estimationPoints"`
 				AssigneeUserID   *int64   `json:"assigneeUserId"`
 				SprintID         *int64   `json:"sprintId"`
+				PriorityKey      *string  `json:"priorityKey"`
 			}
 			payload, err := json.Marshal(raw)
 			if err != nil {
@@ -675,21 +884,24 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 				writeValidationError(w, "invalid json payload", "invalid_json", nil)
 				return true
 			}
-			updateIn := store.UpdateTodoInput{
-				Title:            in.Title,
-				Body:             in.Body,
-				Tags:             in.Tags,
-				EstimationPoints: in.EstimationPoints,
-				AssigneeUserID:   in.AssigneeUserID,
+			patch := todoapp.UpdatePatch{
+				Title:            todoapp.Field[string]{Present: true, Value: in.Title},
+				Body:             todoapp.Field[string]{Present: true, Value: in.Body},
+				Tags:             todoapp.Field[[]string]{Present: true, Value: in.Tags},
+				EstimationPoints: todoapp.Field[*int64]{Present: true, Value: in.EstimationPoints},
+				AssigneeUserID:   todoapp.Field[*int64]{Present: true, Value: in.AssigneeUserID},
 			}
 			if _, hasSprintID := raw["sprintId"]; hasSprintID {
-				if in.SprintID == nil {
-					updateIn.ClearSprint = true
-				} else {
-					updateIn.SprintID = in.SprintID
-				}
+				patch.SprintID = todoapp.Field[*int64]{Present: true, Value: in.SprintID}
 			}
-			todo, err := s.store.UpdateTodoByLocalID(s.requestContext(r), project.ID, localID, updateIn, s.storeMode())
+			if _, hasPriorityKey := raw["priorityKey"]; hasPriorityKey {
+				patch.PriorityKey = todoapp.Field[*string]{Present: true, Value: in.PriorityKey}
+			}
+			prepared := s.todoUpdates.Prepare(s.requestContext(r), todoapp.ResolvedUpdateTarget{
+				ProjectContext: *pc,
+				Mode:           s.storeMode(),
+			})
+			result, err := prepared.Update(todoapp.UpdateCommand{LocalID: localID, Patch: patch})
 			if err != nil {
 				if errors.Is(err, store.ErrUnauthorized) {
 					writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
@@ -698,14 +910,15 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 				writeStoreErr(w, err, true)
 				return true
 			}
-			if !todo.AssignmentChanged {
-				s.emitRefreshNeeded(r.Context(), project.ID, "todo_updated")
-			}
-			writeJSON(w, http.StatusOK, todoToJSON(todo))
+			writeJSON(w, http.StatusOK, todoToJSONForProject(result.Todo, project))
 			return true
 
 		case http.MethodDelete:
-			if err := s.store.DeleteTodoByLocalID(s.requestContext(r), project.ID, localID, s.storeMode()); err != nil {
+			prepared := s.todoDeletes.Prepare(s.requestContext(r), todoapp.ResolvedDeleteTarget{
+				ProjectContext: *pc,
+				Mode:           s.storeMode(),
+			})
+			if err := prepared.Delete(todoapp.DeleteCommand{LocalID: localID}); err != nil {
 				if errors.Is(err, store.ErrUnauthorized) {
 					writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
 					return true
@@ -713,7 +926,6 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 				writeStoreErr(w, err, true)
 				return true
 			}
-			s.emitRefreshNeeded(r.Context(), project.ID, "todo_deleted")
 			w.WriteHeader(http.StatusNoContent)
 			return true
 		}
@@ -743,8 +955,19 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 			writeValidationError(w, "missing toColumnKey", "missing_to_column_key", map[string]any{"field": "toColumnKey"})
 			return true
 		}
-		// Interpret afterId/beforeId as localIds for this project.
-		todo, err := s.store.MoveTodoByLocalID(s.requestContext(r), project.ID, localID, toColumnKey, in.AfterID, in.BeforeID, s.storeMode())
+		// Interpret afterId/beforeId as localIds for this project. The shared
+		// board router already resolved access, so prepare from that value instead
+		// of repeating the slug lookup.
+		prepared := s.todoMoves.Prepare(s.requestContext(r), todoapp.ResolvedMoveTarget{
+			ProjectContext: *pc,
+			Mode:           s.storeMode(),
+		})
+		result, err := prepared.Move(todoapp.MoveCommand{
+			LocalID:       localID,
+			ToColumnKey:   toColumnKey,
+			AfterLocalID:  in.AfterID,
+			BeforeLocalID: in.BeforeID,
+		})
 		if err != nil {
 			if errors.Is(err, store.ErrUnauthorized) {
 				writeError(w, http.StatusForbidden, "FORBIDDEN", "forbidden", nil)
@@ -753,8 +976,7 @@ func (s *Server) handleBoardTodoItemRoutes(w http.ResponseWriter, r *http.Reques
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "todo_moved")
-		writeJSON(w, http.StatusOK, todoToJSON(todo))
+		writeJSON(w, http.StatusOK, todoToJSONForProject(result.Todo, project))
 		return true
 	}
 
@@ -787,14 +1009,11 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 	// POST /api/board/{slug}/sprints - create sprint (Maintainer+)
 	if len(rest) == 2 && rest[1] == "sprints" && r.Method == http.MethodPost {
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-			return true
-		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+		prepared, err := s.sprintDefinitions.PrepareCreate(ctx, sprintapp.ResolvedRESTProjectTarget{
+			ProjectID: project.ID,
+		})
+		if err != nil {
+			writeSprintDefinitionPrepareError(w, err)
 			return true
 		}
 		var in struct {
@@ -809,12 +1028,15 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 			writeValidationError(w, "name required", "name_required", map[string]any{"field": "name"})
 			return true
 		}
-		sprint, err := s.store.CreateSprint(ctx, project.ID, in.Name, time.UnixMilli(in.PlannedStartAt), time.UnixMilli(in.PlannedEndAt))
+		sprint, err := prepared.Create(sprintapp.CreateCommand{
+			Name:           in.Name,
+			PlannedStartAt: time.UnixMilli(in.PlannedStartAt),
+			PlannedEndAt:   time.UnixMilli(in.PlannedEndAt),
+		})
 		if err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "sprint_created")
 		writeJSON(w, http.StatusCreated, sprintToJSON(sprint))
 		return true
 	}
@@ -857,14 +1079,13 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 
 		case http.MethodPatch:
 			ctx := s.requestContext(r)
-			userID, ok := store.UserIDFromContext(ctx)
-			if !ok {
-				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-				return true
-			}
-			role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-			if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-				writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
+			prepared, err := s.sprintDefinitions.PrepareUpdate(ctx, sprintapp.ResolvedRESTSprintTarget{
+				ProjectID: project.ID,
+				SprintID:  sp.ID,
+				Name:      sp.Name,
+			})
+			if err != nil {
+				writeSprintDefinitionPrepareError(w, err)
 				return true
 			}
 			var in struct {
@@ -875,43 +1096,37 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 			if err := readJSON(w, r, s.maxBody, &in); err != nil {
 				return true
 			}
-			opts := store.UpdateSprintInput{}
-			if in.Name != nil {
-				opts.Name = in.Name
-			}
+			command := sprintapp.UpdateCommand{Name: in.Name}
 			if in.PlannedStartAt != nil {
 				t := time.UnixMilli(*in.PlannedStartAt)
-				opts.PlannedStartAt = &t
+				command.PlannedStartAt = &t
 			}
 			if in.PlannedEndAt != nil {
 				t := time.UnixMilli(*in.PlannedEndAt)
-				opts.PlannedEndAt = &t
+				command.PlannedEndAt = &t
 			}
-			if err := s.store.UpdateSprint(ctx, sprintID, opts); err != nil {
+			if err := prepared.Update(command); err != nil {
 				writeStoreErr(w, err, true)
 				return true
 			}
-			s.emitRefreshNeeded(r.Context(), project.ID, "sprint_updated")
 			w.WriteHeader(http.StatusNoContent)
 			return true
 
 		case http.MethodDelete:
 			ctx := s.requestContext(r)
-			userID, ok := store.UserIDFromContext(ctx)
-			if !ok {
-				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+			prepared, err := s.sprintDeletions.PrepareDelete(ctx, sprintapp.DeletionTarget{
+				ProjectID: project.ID,
+				SprintID:  sprintID,
+				Name:      sp.Name,
+			})
+			if err != nil {
+				writeSprintLifecyclePrepareError(w, err)
 				return true
 			}
-			role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-			if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-				writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
-				return true
-			}
-			if err := s.store.DeleteSprint(ctx, project.ID, sprintID); err != nil {
+			if err := prepared.Delete(); err != nil {
 				writeStoreErr(w, err, true)
 				return true
 			}
-			s.emitRefreshNeeded(r.Context(), project.ID, "sprint_deleted")
 			w.WriteHeader(http.StatusNoContent)
 			return true
 
@@ -944,21 +1159,18 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 			return true
 		}
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+		prepared, err := s.sprintLifecycle.PrepareActivate(ctx, sprintapp.TransitionTarget{
+			ProjectID: project.ID,
+			SprintID:  sprintID,
+		})
+		if err != nil {
+			writeSprintLifecyclePrepareError(w, err)
 			return true
 		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
-			return true
-		}
-		if err := s.store.ActivateSprint(ctx, project.ID, sprintID); err != nil {
+		if err := prepared.Activate(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "sprint_activated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -971,21 +1183,18 @@ func (s *Server) handleBoardSprintRoutes(w http.ResponseWriter, r *http.Request,
 			return true
 		}
 		ctx := s.requestContext(r)
-		userID, ok := store.UserIDFromContext(ctx)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+		prepared, err := s.sprintLifecycle.PrepareClose(ctx, sprintapp.TransitionTarget{
+			ProjectID: project.ID,
+			SprintID:  sprintID,
+		})
+		if err != nil {
+			writeSprintLifecyclePrepareError(w, err)
 			return true
 		}
-		role, err := s.store.GetProjectRole(ctx, project.ID, userID)
-		if err != nil || !role.HasMinimumRole(store.RoleMaintainer) {
-			writeError(w, http.StatusForbidden, "FORBIDDEN", "maintainer or higher required", nil)
-			return true
-		}
-		if err := s.store.CloseSprint(ctx, sprintID); err != nil {
+		if err := prepared.Close(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "sprint_closed")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -1003,17 +1212,7 @@ func (s *Server) handleBoardTagRoutes(w http.ResponseWriter, r *http.Request, re
 			writeStoreErr(w, err, true)
 			return true
 		}
-		// Convert TagCount to TagWithColor (tag_id and canDelete from store)
-		tagList := make([]store.TagWithColor, len(tags))
-		for i, tc := range tags {
-			tagList[i] = store.TagWithColor{
-				TagID:     tc.TagID,
-				Name:      tc.Name,
-				Color:     tc.Color,
-				CanDelete: tc.CanDelete,
-			}
-		}
-		writeJSON(w, http.StatusOK, tagsToJSON(tagList))
+		writeJSON(w, http.StatusOK, tagCountsToJSON(tags))
 		return true
 	}
 
@@ -1049,32 +1248,40 @@ func (s *Server) handleBoardTagRoutes(w http.ResponseWriter, r *http.Request, re
 			return true
 		}
 		var viewerUserID *int64
-		if userID, ok := store.UserIDFromContext(ctx); ok {
+		if project.ExpiresAt != nil {
+			if userID, ok := store.UserIDFromContext(ctx); ok {
+				viewerUserID = &userID
+			}
+		} else {
+			userID, ok := store.UserIDFromContext(ctx)
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+				return true
+			}
 			viewerUserID = &userID
 		}
-		var patchColorErr error
-		if project.ExpiresAt != nil {
-			patchColorErr = s.store.UpdateTagColorForTemporaryBoard(ctx, project.ID, viewerUserID, tagID, in.Color)
-		} else {
-			patchColorErr = s.store.UpdateTagColor(ctx, viewerUserID, tagID, in.Color)
-		}
-		if patchColorErr != nil {
-			writeStoreErr(w, patchColorErr, true)
+		prepared, err := s.tagColors.PrepareProjectID(ctx, tagapp.ProjectIDColorCommand{
+			Project:      resolvedRESTTagProject(project),
+			ViewerUserID: viewerUserID,
+			TagID:        tagID,
+			Color:        tagapp.NewColorIntent(in.Color),
+		})
+		if err != nil {
+			writeTagColorPrepareError(w, err)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "tag_color_updated")
+		if err := prepared.Update(); err != nil {
+			writeStoreErr(w, err, true)
+			return true
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
-	// PATCH /api/board/{slug}/tags/{tagName}/color - update tag color by name (temporary boards only).
-	// Durable projects must use /tags/id/{tagId}/color.
+	// PATCH /api/board/{slug}/tags/{tagName}/color - update tag color by name.
+	// Temporary/anonymous boards resolve board-scoped or link-holder tags; durable
+	// projects set the authenticated viewer's personal color for the grouped label.
 	if len(rest) == 4 && rest[1] == "tags" && rest[3] == "color" && r.Method == http.MethodPatch {
-		if project.ExpiresAt == nil {
-			writeValidationError(w, "name-based color update not allowed for durable projects; use /tags/id/{tagId}/color", "name_based_tag_route_not_allowed", nil)
-			return true
-		}
-		linkTemporaryBoard := true
 		ctx := s.requestContext(r)
 		tagName := rest[2]
 		var in struct {
@@ -1085,21 +1292,40 @@ func (s *Server) handleBoardTagRoutes(w http.ResponseWriter, r *http.Request, re
 		}
 
 		var viewerUserID *int64
-		if userID, ok := store.UserIDFromContext(ctx); ok {
+		if project.ExpiresAt == nil {
+			// Durable project: name-based personal color for any authenticated member.
+			// SetViewerTagColorByName enforces membership. Same known limitation as the
+			// /api/projects route: only this project is refreshed, and the viewer's other
+			// boards sharing the backing rows pick the color up on next load.
+			userID, ok := store.UserIDFromContext(ctx)
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
+				return true
+			}
+			viewerUserID = &userID
+		} else if userID, ok := store.UserIDFromContext(ctx); ok {
 			viewerUserID = &userID
 		}
 
-		if err := s.store.UpdateTagColorForProject(ctx, project.ID, viewerUserID, tagName, in.Color, linkTemporaryBoard); err != nil {
+		prepared, err := s.tagColors.PrepareProjectName(ctx, tagapp.ProjectNameColorCommand{
+			Project:      resolvedRESTTagProject(project),
+			ViewerUserID: viewerUserID,
+			Name:         tagName,
+			Color:        tagapp.NewColorIntent(in.Color),
+		})
+		if err != nil {
+			writeTagColorPrepareError(w, err)
+			return true
+		}
+		if err := prepared.Update(); err != nil {
 			writeStoreErr(w, err, true)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "tag_color_updated")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
 	// DELETE /api/board/{slug}/tags/id/{tagId} - delete by tag_id (preferred; authority by tag_id).
-	isAnonymousBoard := project.ExpiresAt != nil && project.CreatorUserID == nil
 	if len(rest) == 4 && rest[1] == "tags" && rest[2] == "id" && r.Method == http.MethodDelete {
 		ctx := s.requestContext(r)
 		var tagID int64
@@ -1107,56 +1333,51 @@ func (s *Server) handleBoardTagRoutes(w http.ResponseWriter, r *http.Request, re
 			writeValidationError(w, "invalid tagId", "invalid_tag_id", map[string]any{"field": "tagId"})
 			return true
 		}
-		userID, _ := store.UserIDFromContext(ctx)
-		if err := s.store.DeleteTag(ctx, userID, tagID, isAnonymousBoard); err != nil {
-			writeStoreErr(w, err, true)
+		var actorUserID *int64
+		if userID, ok := store.UserIDFromContext(ctx); ok {
+			actorUserID = &userID
+		}
+		prepared, err := s.tagDeletions.PrepareProjectID(ctx, tagapp.ProjectIDDeleteCommand{
+			Project:     resolvedRESTTagProject(project),
+			ActorUserID: actorUserID,
+			TagID:       tagID,
+		})
+		if err != nil {
+			writeTagDeletionError(w, err)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "tag_deleted")
+		if err := prepared.Delete(); err != nil {
+			writeTagDeletionError(w, err)
+			return true
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
 
-	// DELETE /api/board/{slug}/tags/{tagName} - delete by name (anonymous-only).
-	// Name-based mutation routes are anonymous-only. Durable projects must use tag_id.
+	// DELETE /api/board/{slug}/tags/{tagName} - delete by name.
+	// Durable projects delete only the caller's own personal tag rows for the name
+	// (grouped label persists if other members still use it). Anonymous/temporary
+	// boards keep the board-scoped resolution below.
 	if len(rest) == 3 && rest[1] == "tags" && r.Method == http.MethodDelete {
-		if !isAnonymousBoard {
-			writeValidationError(w, "name-based delete not allowed for durable projects; use /tags/id/{tagId}", "name_based_tag_route_not_allowed", nil)
-			return true
-		}
 		ctx := s.requestContext(r)
 		tagName := rest[2]
-		userID, hasUserID := store.UserIDFromContext(ctx)
-
-		boardTagID, err := s.store.GetBoardScopedTagIDByName(ctx, project.ID, tagName)
-		if err == nil {
-			if err := s.store.DeleteTag(ctx, 0, boardTagID, isAnonymousBoard); err != nil {
-				writeStoreErr(w, err, true)
-				return true
-			}
-			s.emitRefreshNeeded(r.Context(), project.ID, "tag_deleted")
-			w.WriteHeader(http.StatusNoContent)
-			return true
+		var actorUserID *int64
+		if userID, ok := store.UserIDFromContext(ctx); ok {
+			actorUserID = &userID
 		}
-		if !errors.Is(err, store.ErrNotFound) {
-			writeStoreErr(w, err, true)
-			return true
-		}
-
-		if !hasUserID {
-			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "unauthorized", nil)
-			return true
-		}
-		tagID, err := s.store.GetTagIDByName(ctx, userID, tagName)
+		prepared, err := s.tagDeletions.PrepareProjectName(ctx, tagapp.ProjectNameDeleteCommand{
+			Project:     resolvedRESTTagProject(project),
+			ActorUserID: actorUserID,
+			Name:        tagName,
+		})
 		if err != nil {
-			writeStoreErr(w, err, true)
+			writeTagDeletionError(w, err)
 			return true
 		}
-		if err := s.store.DeleteTag(ctx, userID, tagID, isAnonymousBoard); err != nil {
-			writeStoreErr(w, err, true)
+		if err := prepared.Delete(); err != nil {
+			writeTagDeletionError(w, err)
 			return true
 		}
-		s.emitRefreshNeeded(r.Context(), project.ID, "tag_deleted")
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}

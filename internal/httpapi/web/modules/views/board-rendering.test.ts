@@ -1,8 +1,11 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Board } from '../types.js';
-import { buildTopbarHtml, renderTodoCard } from './board-rendering.js';
-import { buildTopbarHtml as buildTopbarHtmlDist } from '../../dist/views/board-rendering.js';
+import { buildBoardColumnsHtml, buildTopbarHtml, getBoardColumns, renderTodoCard } from './board-rendering.js';
+import {
+  buildBoardColumnsHtml as buildBoardColumnsHtmlDist,
+  buildTopbarHtml as buildTopbarHtmlDist,
+} from '../../dist/views/board-rendering.js';
 import enCatalog from '../i18n/locales/en.json';
 import pseudoCatalog from '../i18n/locales/pseudo.json';
 
@@ -35,10 +38,35 @@ function renderTopbar(showVoiceCommands: boolean): string {
   });
 }
 
+function renderMobileColumns(render: typeof buildBoardColumnsHtml, value: Board): HTMLElement {
+  const boardCols = [
+    { key: 'backlog', title: 'Backlog', isDone: false },
+    { key: 'done', title: 'Done', isDone: true },
+  ];
+  const host = document.createElement('div');
+  host.innerHTML = render({
+    boardCols,
+    board: value,
+    activeMobileTab: 'backlog',
+    laneMetaByKey: {},
+    laneDisplayCount: (key) => value.columns[key]?.length ?? 0,
+    membersByUserId: {},
+    cardOpts: {
+      priorityTiers: {
+        normal: { name: 'Normal', color: '#6B7280' },
+        high: { name: 'High', color: '#EF4444' },
+      },
+    },
+  });
+  return host;
+}
+
 describe('board topbar rendering', () => {
   afterEach(async () => {
     const i18n = await import('../i18n/index.js');
+    const distI18n = await import('../../dist/i18n/index.js');
     i18n.resetI18nForTests();
+    distI18n.resetI18nForTests();
   });
 
   it('renders the voice command trigger only when explicitly enabled', () => {
@@ -106,5 +134,138 @@ describe('board topbar rendering', () => {
     expect(html).not.toContain('graph TD');
     expect(html).not.toContain('A--&gt;B');
     expect(html).not.toContain('todo-mermaid');
+    expect(html).not.toContain('card__agenda-badge');
+  });
+
+  it('always renders a drag handle, even under chronological sort where only cross-lane drag is allowed', () => {
+    const todo = {
+      id: 7,
+      localId: 12,
+      title: 'Reorder me',
+      body: '',
+      status: 'BACKLOG',
+      tags: [],
+    };
+
+    const html = renderTodoCard(todo);
+    expect(html).toContain('card__drag-handle');
+    expect(html).toContain('aria-label="Drag card"');
+    expect(html).toContain('data-i18n-aria-label="board.todo.dragCard"');
+  });
+
+  it('renders a priority badge with the tier name and color when the todo has a priority set', async () => {
+    const i18n = await import('../i18n/index.js');
+    await i18n.initI18n({
+      locale: 'en',
+      loadLocale: vi.fn(async () => enCatalog),
+    });
+
+    const todo = {
+      id: 8,
+      localId: 13,
+      title: 'Urgent fix',
+      body: '',
+      status: 'BACKLOG',
+      tags: [],
+      priorityKey: 'urgent',
+    };
+
+    const html = renderTodoCard(todo, undefined, undefined, {
+      priorityTiers: { urgent: { name: 'Urgent', color: '#EF4444' } },
+    });
+
+    expect(html).toContain('card__priority');
+    expect(html).toContain('Urgent');
+    expect(html).toContain('#EF4444');
+  });
+
+  it('omits the priority badge when the todo has no priority set', async () => {
+    const i18n = await import('../i18n/index.js');
+    await i18n.initI18n({
+      locale: 'en',
+      loadLocale: vi.fn(async () => enCatalog),
+    });
+
+    const todo = {
+      id: 9,
+      localId: 14,
+      title: 'No priority',
+      body: '',
+      status: 'BACKLOG',
+      tags: [],
+      priorityKey: null,
+    };
+
+    const html = renderTodoCard(todo, undefined, undefined, {
+      priorityTiers: { urgent: { name: 'Urgent', color: '#EF4444' } },
+    });
+
+    expect(html).not.toContain('card__priority');
+  });
+
+  it.each([
+    ['maintained source', buildBoardColumnsHtml],
+    ['committed runtime', buildBoardColumnsHtmlDist],
+  ])('keeps Backlog active while a todo moved to Done disappears from that mobile lane (%s)', (_label, render) => {
+    const value = board();
+    value.columnOrder = [
+      { key: 'backlog', name: 'Backlog', isDone: false },
+      { key: 'done', name: 'Done', isDone: true },
+    ];
+    value.columns = {
+      backlog: [],
+      done: [{ id: 11, localId: 4, title: 'Moved', status: 'DONE', tags: [] }],
+    };
+
+    const host = renderMobileColumns(render, value);
+
+    expect(host.querySelector('[data-column="backlog"]')?.classList.contains('col--mobile-active')).toBe(true);
+    expect(host.querySelector('[data-column="backlog"] .card')).toBeNull();
+    expect(host.querySelector('[data-column="done"]')?.classList.contains('col--mobile-active')).toBe(false);
+    expect(host.querySelector('[data-column="done"] .card')?.textContent).toContain('Moved');
+  });
+
+  it.each([
+    ['maintained source', buildBoardColumnsHtml],
+    ['committed runtime', buildBoardColumnsHtmlDist],
+  ])('renders the refreshed High badge on an ordinary unfiltered mobile board (%s)', async (_label, render) => {
+    const i18n = await import('../i18n/index.js');
+    const distI18n = await import('../../dist/i18n/index.js');
+    await i18n.initI18n({ locale: 'en', loadLocale: vi.fn(async () => enCatalog) });
+    await distI18n.initI18n({ locale: 'en', loadLocale: vi.fn(async () => enCatalog) });
+    const value = board();
+    value.columnOrder = [
+      { key: 'backlog', name: 'Backlog', isDone: false },
+      { key: 'done', name: 'Done', isDone: true },
+    ];
+    value.columns = {
+      backlog: [{ id: 12, localId: 5, title: 'Escalated', status: 'BACKLOG', tags: [], priorityKey: 'high' }],
+      done: [],
+    };
+
+    const host = renderMobileColumns(render, value);
+
+    expect(host.querySelector('[data-column="backlog"]')?.classList.contains('col--mobile-active')).toBe(true);
+    expect(host.querySelector('[data-column="backlog"] .card__priority')?.textContent).toBe('High');
+    expect(host.querySelector('[data-column="backlog"] .card')?.textContent).not.toContain('Normal');
+  });
+});
+
+describe('getBoardColumns workflow isolation', () => {
+  it('uses only columnOrder keys even when columns contains extra keys', () => {
+    const value = board();
+    value.columnOrder = [
+      { key: 'backlog', name: 'Backlog', isDone: false },
+      { key: 'doing', name: 'In Progress', isDone: false },
+      { key: 'done', name: 'Done', isDone: true },
+    ];
+    value.columns = {
+      backlog: [],
+      doing: [],
+      done: [],
+      agenda: [{ id: 99, localId: 99, title: 'Not a workflow lane', status: 'agenda' }],
+    };
+
+    expect(getBoardColumns(value).map((column) => column.key)).toEqual(['backlog', 'doing', 'done']);
   });
 });

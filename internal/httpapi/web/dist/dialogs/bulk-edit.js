@@ -3,10 +3,10 @@ import { apiFetch } from "../api.js";
 import { showToast, escapeHTML, isAnonymousBoard, sanitizeHexColor } from "../utils.js";
 import { applyFieldTooltips, BULK_EDIT_TOOLTIPS } from "../field-tooltips.js";
 import { hasI18nKey, I18N_LOCALE_CHANGED, t } from "../i18n/index.js";
-import { getBoard, getSlug, getTag, getSearch, getSprintIdFromUrl, getBoardMembers, } from "../state/selectors.js";
+import { getAssigneeFromUrl, getPriorityFromUrl, getSortFromUrl, getBoard, getSlug, getTag, getSearch, getSprintIdFromUrl, getBoardMembers, } from "../state/selectors.js";
 import { invalidateBoard } from "../orchestration/board-refresh.js";
 import { setBulkUpdating } from "../realtime/guard.js";
-import { normalizeSprints } from "../sprints.js";
+import { boardSprintsEnabled, normalizeSprints } from "../sprints.js";
 import { invalidateTagsCache } from "./settings.js";
 import { normalizeTagName, resolveColumnKey } from "./todo.js";
 const EST_POINTS = new Set([1, 2, 3, 5, 8, 13, 20, 40]);
@@ -183,7 +183,7 @@ function setPermissionsVisibility(role) {
     if (els.assignRow)
         els.assignRow.style.display = !anonymous ? "" : "none";
     if (els.sprintRow)
-        els.sprintRow.style.display = !anonymous && role === "maintainer" ? "" : "none";
+        els.sprintRow.style.display = !anonymous && role === "maintainer" && boardSprintsEnabled(board) ? "" : "none";
     if (els.tagsRow)
         els.tagsRow.style.display = isMaintainer ? "" : "none";
     if (els.estRow)
@@ -247,7 +247,9 @@ export async function openBulkEditDialog(initialIds, opts) {
         els.est.value = "";
     populateStatusSelect(els.status);
     populateAssigneeSelect(els.assignee);
-    await populateSprintSelect(els.sprint);
+    if (boardSprintsEnabled(getBoard())) {
+        await populateSprintSelect(els.sprint);
+    }
     setPermissionsVisibility(opts.role);
     updateApplyButtonState();
     setBulkEditPendingIds(kept, opts.onPruned);
@@ -259,7 +261,7 @@ export async function openBulkEditDialog(initialIds, opts) {
 async function runBulkApply(todoIds) {
     const els = getBulkFormEls();
     const applyAssign = !!els.applyAssign?.checked;
-    const applySprint = !!els.applySprint?.checked;
+    const applySprint = boardSprintsEnabled(getBoard()) && !!els.applySprint?.checked;
     const applyStatus = !!els.applyStatus?.checked;
     const applyTags = !!els.applyTags?.checked;
     const applyEst = !!els.applyEst?.checked;
@@ -352,7 +354,7 @@ async function runBulkApply(todoIds) {
     if (anyTagsAdded) {
         invalidateTagsCache();
     }
-    await invalidateBoard(slug, getTag(), getSearch(), getSprintIdFromUrl());
+    await invalidateBoard(slug, getTag(), getSearch(), getSprintIdFromUrl(), getAssigneeFromUrl(), getSortFromUrl(), getPriorityFromUrl());
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
             window.scrollTo(scrollX, scrollY);

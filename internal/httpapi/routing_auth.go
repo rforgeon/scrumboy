@@ -2,7 +2,10 @@ package httpapi
 
 import (
 	"errors"
+	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
 	"time"
 
 	"scrumboy/internal/auth/tokens"
@@ -48,7 +51,27 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 		return
 	}
 
-	// GET /api/auth/oidc/login, GET /api/auth/oidc/callback
+	// POST /api/auth/request-password-reset - no session required; enumeration-safe
+	if len(rest) == 1 && rest[0] == "request-password-reset" {
+		s.handleAuthRequestPasswordReset(w, r)
+		return
+	}
+
+	if len(rest) == 3 && rest[0] == "oidc" && rest[1] == "set-password" {
+		switch rest[2] {
+		case "start":
+			s.handleOIDCSetPasswordStart(w, r)
+			return
+		case "status":
+			s.handleOIDCSetPasswordStatus(w, r)
+			return
+		}
+	}
+	if len(rest) == 3 && rest[0] == "oidc" && rest[1] == "link" && rest[2] == "start" {
+		s.handleOIDCLinkStart(w, r)
+		return
+	}
+	// OIDC login/callback and first-password completion.
 	if len(rest) == 2 && rest[0] == "oidc" {
 		switch rest[1] {
 		case "login":
@@ -56,6 +79,9 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 			return
 		case "callback":
 			s.handleOIDCCallback(w, r)
+			return
+		case "set-password":
+			s.handleOIDCSetPassword(w, r)
 			return
 		}
 	}
@@ -79,12 +105,14 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 		// Anonymous mode: return noop response (no console errors, clear contract)
 		if s.mode == "anonymous" {
 			writeJSON(w, http.StatusOK, map[string]any{
-				"user":                 nil,
-				"bootstrapAvailable":   false,
-				"mode":                 "anonymous",
-				"pushConfigured":       false,
-				"markdownNotesEnabled": s.markdownNotesEnabled,
-				"mermaidNotesEnabled":  s.mermaidNotesEnabled,
+				"user":                            nil,
+				"bootstrapAvailable":              false,
+				"mode":                            "anonymous",
+				"pushConfigured":                  false,
+				"selfServicePasswordResetEnabled": false,
+				"emailNotifyAvailable":            false,
+				"markdownNotesEnabled":            s.markdownNotesEnabled,
+				"mermaidNotesEnabled":             s.mermaidNotesEnabled,
 			})
 			return
 		}
@@ -102,6 +130,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 		bootstrapAvailable := n == 0 && localAuthEnabled
 
 		var user any = nil
+		includePushStatus := false
 		// Fetch full user record to include isBootstrap flag
 		if userID, ok := store.UserIDFromContext(ctx); ok {
 			u, err := s.store.GetUser(ctx, userID)
@@ -110,20 +139,26 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 				user = nil
 			} else {
 				user = userStatusJSON(u)
+				includePushStatus = true
 			}
 		}
 
 		resp := map[string]any{
-			"user":                 user,
-			"bootstrapAvailable":   bootstrapAvailable,
-			"mode":                 "full",
-			"pushConfigured":       s.pushVapidConfigured,
-			"markdownNotesEnabled": s.markdownNotesEnabled,
-			"mermaidNotesEnabled":  s.mermaidNotesEnabled,
+			"user":                            user,
+			"bootstrapAvailable":              bootstrapAvailable,
+			"mode":                            "full",
+			"pushConfigured":                  s.pushVapidConfigured,
+			"selfServicePasswordResetEnabled": s.selfServicePasswordResetEnabled(),
+			"markdownNotesEnabled":            s.markdownNotesEnabled,
+			"mermaidNotesEnabled":             s.mermaidNotesEnabled,
 		}
 		resp["oidcEnabled"] = s.oidcService != nil
 		resp["localAuthEnabled"] = localAuthEnabled
 		resp["wallEnabled"] = s.wallEnabled
+		resp["emailNotifyAvailable"] = s.smtpConfigured && s.publicBaseURL != ""
+		if includePushStatus {
+			resp["push"] = s.pushStatus
+		}
 		writeJSON(w, http.StatusOK, resp)
 		return
 
@@ -195,7 +230,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, rest []strin
 		if err := readJSON(w, r, s.maxBody, &in); err != nil {
 			return
 		}
-		ipKey := "ip:" + clientIP(r)
+		ipKey := "ip:" + s.clientIP(r)
 		emailKey := "email:" + ratelimit.NormalizeEmail(in.Email)
 		if s.authRateLimit != nil && !s.authRateLimit.Allow(ipKey, emailKey) {
 			writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
@@ -280,9 +315,13 @@ func (s *Server) handleAuthResetPassword(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
 		return
 	}
+	if s.oidcService != nil && s.oidcService.Config().LocalAuthDisabled {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+		return
+	}
 
 	// Rate limit by IP (reuse auth ratelimit)
-	if s.authRateLimit != nil && !s.authRateLimit.Allow("ip:"+clientIP(r), "") {
+	if s.authRateLimit != nil && !s.authRateLimit.Allow("ip:"+s.clientIP(r), "") {
 		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
 		return
 	}
@@ -318,17 +357,149 @@ func (s *Server) handleAuthResetPassword(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Store enforces auth.ValidatePassword internally
-	if err := s.store.UpdateUserPassword(ctx, userID, in.NewPassword); err != nil {
+	if err := s.store.ResetLocalPassword(ctx, userID, passwordHash, in.NewPassword); err != nil {
 		writeStoreErr(w, err, true)
-		return
-	}
-
-	if err := s.store.DeleteSessionsByUserID(ctx, userID); err != nil {
-		writeInternal(w, err)
 		return
 	}
 	clearSessionCookie(w, r)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleAuthRequestPasswordReset lets a user self-serve a password-reset
+// email, as an alternative to the admin-generated link
+// (handleAdminUsersPasswordReset). It is deliberately enumeration-safe: the
+// response is always identical whether or not the submitted email matches an
+// account, whether SMTP is configured, and whether the encryption key is
+// configured. Only the fully-successful path (user exists, SMTP configured,
+// token generated) enqueues an email. minPasswordResetRequestDuration floors
+// the response time so the account-exists path's extra DB calls and token
+// generation can't be timed to distinguish it from the account-not-found path.
+// minPasswordResetRequestDuration is a floor on this handler's total
+// response time, so that the extra DB lookups and token generation on the
+// account-exists path don't create a timing side-channel for enumerating
+// accounts (the response body is already identical on every path).
+const minPasswordResetRequestDuration = 200 * time.Millisecond
+
+func (s *Server) handleAuthRequestPasswordReset(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+		return
+	}
+	if s.mode == "anonymous" {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+		return
+	}
+	if s.oidcService != nil && s.oidcService.Config().LocalAuthDisabled {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "not found", nil)
+		return
+	}
+
+	// Require application/json as defense in depth so cross-origin simple
+	// text/plain POSTs cannot reach the mail path if route-level protections change.
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeValidationError(w, "Content-Type must be application/json", "invalid_content_type", map[string]any{"field": "Content-Type"})
+		return
+	}
+
+	var in struct {
+		Email string `json:"email"`
+	}
+	if err := readJSON(w, r, s.maxBody, &in); err != nil {
+		return
+	}
+	email := ratelimit.NormalizeEmail(in.Email)
+
+	// Rate limit before any DB lookup or config check, so neither an
+	// unconfigured-SMTP response nor a per-email limiter bypass can become a
+	// timing or enumeration oracle. 5/min per IP, 5/min per submitted email.
+	if s.passwordResetRequestLimiter != nil && !s.passwordResetRequestLimiter.Allow("ip:"+s.clientIP(r), email) {
+		writeError(w, http.StatusTooManyRequests, "RATE_LIMITED", "too many attempts; try again later", nil)
+		return
+	}
+
+	// Generic response, identical regardless of what happens below (user not
+	// found, SMTP not configured, encryption key missing, or full success).
+	// This is the enumeration-safety contract for this endpoint: no branch
+	// below may change status code or body shape based on account existence.
+	respond := func() {
+		if elapsed := time.Since(start); elapsed < minPasswordResetRequestDuration {
+			time.Sleep(minPasswordResetRequestDuration - elapsed)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"message": "If that account exists, a password reset email has been sent.",
+		})
+	}
+
+	// Self-service reset requires SCRUMBOY_PUBLIC_BASE_URL (see resetBaseURL).
+	// This endpoint is unauthenticated, so we fail closed when the base URL is
+	// unset rather than building a link from the attacker-controlled Host header.
+	if email == "" || !s.selfServicePasswordResetEnabled() {
+		respond()
+		return
+	}
+
+	ctx := s.requestContext(r)
+	u, err := s.store.GetUserByEmail(ctx, email)
+	if err != nil {
+		respond()
+		return
+	}
+
+	passwordHash, err := s.store.GetUserPasswordHash(ctx, u.ID)
+	if err != nil {
+		respond()
+		return
+	}
+	token, _, err := tokens.GeneratePasswordResetToken(s.encryptionKey, u.ID, passwordHash)
+	if err != nil {
+		s.logger.Printf("password reset request: generate token user=%d: %v", u.ID, err)
+		respond()
+		return
+	}
+
+	resetURL := s.resetBaseURL(r) + "/auth/reset-password?token=" + url.QueryEscape(token)
+
+	if !s.transactionalMailQueue.Enqueue(mailDelivery{
+		To:      u.Email,
+		Subject: "Reset your Scrumboy password",
+		Body: "A password reset was requested for your Scrumboy account.\n\n" +
+			"Reset your password using this link (expires in 30 minutes):\n" + resetURL + "\n\n" +
+			"If you did not request this, you can safely ignore this email.\n",
+		LogRef: fmt.Sprintf("password-reset user=%d", u.ID),
+	}) {
+		s.logger.Printf("password reset request: transactional mail queue rejected user=%d", u.ID)
+	}
+
+	respond()
+}
+
+// resetBaseURL returns the origin (scheme + host, no trailing slash) to use
+// when building password-reset links, for both the self-service email flow
+// above and the admin-generated link in handleAdminUsersPasswordReset.
+//
+// If SCRUMBOY_PUBLIC_BASE_URL is configured, it is used verbatim and the
+// inbound request is never consulted. Otherwise this falls back to deriving
+// the origin from X-Forwarded-Proto/Host on the request itself. The
+// self-service caller above never reaches this fallback: it refuses to send
+// an email at all when SCRUMBOY_PUBLIC_BASE_URL is unset, since that endpoint
+// is unauthenticated and the Host header is attacker-controlled there. The
+// fallback only fires for the admin-generated link, which requires an
+// authenticated owner and is returned to them directly rather than emailed
+// to the target user.
+func (s *Server) resetBaseURL(r *http.Request) string {
+	if s.publicBaseURL != "" {
+		return s.publicBaseURL
+	}
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+	return proto + "://" + r.Host
 }
